@@ -1,0 +1,21 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+!.env.*.example
+# Runtime, documents and generated files
+.venv/
+.cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
+*.egg-info/
+output/
+tmp/
+local-state/
+tools/ocr/
+*.log
+.DS_Store
+Thumbs.db

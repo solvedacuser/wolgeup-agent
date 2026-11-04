@@ -1,0 +1,79 @@
+{
+  "manifest_version": "pending-v1",
+  "cells": [
+    {
+      "cell_id": "H-STD/W-01",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "H-STD/W-02",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "H-STD/W-03",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "H-STD/W-04",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "H-STD/W-05",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "H-STD/R-07",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "M-STD/W-01",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "M-STD/W-02",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "M-STD/W-03",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "M-STD/W-04",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "M-STD/W-05",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    },
+    {
+      "cell_id": "M-STD/R-07",
+      "required_for_release": true,
+      "verification_status": "pending",
+      "rule_versions": []
+    }
+  ],
+  "release_ready": false,
+  "reason": "Independent legal-rule and complete-profile verification pending"
+}
