@@ -6,16 +6,16 @@ const vm = require("node:vm");
 const elements = new Map(), created = [], requests = [], timers = new Map();
 let timerId = 0;
 class Element {
-  constructor(tag) { this.tagName=tag;this.children=[];this.value="";this.checked=false;this.disabled=false;this.hidden=false;this.dataset={};this.listeners={};this.textContent="";this.classList={toggle(){}}; }
+  constructor(tag) { this.tagName=tag;this.children=[];this.value="";this.checked=false;this.disabled=false;this.hidden=false;this.dataset={};this.listeners={};this.textContent="";this.classList={toggle(){},remove(){},add(){}}; }
   append(...children) { for(const child of children){this.children.push(child);child.parent=this;} }
-  replaceChildren(...children) { this.children=[];this.append(...children); }
+  replaceChildren(...children) { this.children.forEach(child=>child.parent=null);this.children=[];this.append(...children); }
   setAttribute(name,value) { this[name]=value; }
   addEventListener(name,handler) { this.listeners[name]=handler; }
-  closest() { return this.parent||get(this.id==="upload"?"upload-label":"label-for-"+this.id); }
+  closest(selector) { for(let current=this;current;current=current.parent){if(selector?.startsWith(".")?(current.className||"").split(" ").includes(selector.slice(1)):current.tagName===selector)return current;}return this.parent||get(this.id==="upload"?"upload-label":"label-for-"+this.id); }
   before() {}
 }
 function get(id) {
-  const dynamic=created.find(el=>el.id===id);if(dynamic)return dynamic;
+  const dynamic=created.findLast(el=>el.id===id);if(dynamic)return dynamic;
   if(!elements.has(id)){const el=new Element(id.includes("unit")||id==="document-type"?"select":"div");el.id=id;elements.set(id,el);}
   return elements.get(id);
 }
@@ -29,20 +29,21 @@ const selected={contract_case_id:"contract-1",attendance_case_ids:["work-1"],pay
 const materials={selection:selected,sources:sources.filter(s=>s.has_extraction).map(s=>({...s,ref:{source_id:"source-"+s.case_id}})),earnings:[{item_id:"earning-1",label:"기본급",amount:null,evidence_refs:["slip-ev"]}],deductions:[{item_id:"deduction-1",label:"공제",amount:"200000",evidence_refs:["slip-ev"]}],transactions:[{transaction_id:"bank-tx",date:"2026-10-31",description:"급여",amount:"2800000",transaction_amount:"2800000",evidence_refs:["bank-ev"]}],evidence_catalog:[{evidence_id:"slip-ev",source_id:"source-slip-ocr-1",page:1,quote:"기본급 3,000,000",verification_method:"ocr_unverified"},{evidence_id:"bank-ev",source_id:"source-bank-1",page:2,quote:"급여 2,800,000",verification_method:"text_match"}],warnings:["원문 확인 필요"]};
 const draft={values:{contract_rate:"3000000"},manual:{},contract_unit:"KRW/month",slip_unit:"KRW/month",period_start:"2026-10-01",period_end:"2026-10-31",time_kind:"",earnings_complete:false,deductions_complete:false,payment_scope_confirmed:false,synthetic_auxiliary:false,material_review:{}};
 let savedCase={id:"main",document_id:"work-pdf",document_type:"attendance",draft,materials,jobs:[],dirty:true,confirmed_revision:null,analysis:null};
-const responses={"/api/extraction-profiles":profiles,"/api/health":{provider_mode:"fixture"},"/api/documents":{documents:[]},"/api/evaluation":{},"/api/comparison-sources":{sources}};
+const responses={"/api/extraction-profiles":profiles,"/api/health":{model:"test-model"},"/api/documents":{documents:[]},"/api/comparison-sources":{sources}};
 const context=vm.createContext({
-  document:{getElementById:get,createElement:tag=>{const el=new Element(tag);created.push(el);return el;},querySelectorAll:selector=>selector.startsWith("#confirmation-form")?descendants(get("confirmation-form")).filter(el=>["input","select"].includes(el.tagName)):[]},
+  document:{body:{dataset:{}},getElementById:get,createElement:tag=>{const el=new Element(tag);created.push(el);return el;},querySelectorAll:selector=>selector.startsWith("#confirmation-form")?descendants(get("confirmation-form")).filter(el=>["input","select"].includes(el.tagName)):[]},
   fetch:async(url,options)=>{requests.push({url,method:options.method,body:options.body?JSON.parse(options.body):null});let result;
     if(url==="/api/cases/main/materials"&&options.method==="PUT"){const selection=JSON.parse(options.body),hasSelection=Object.values(selection).some(value=>Array.isArray(value)?value.length:Boolean(value));savedCase={...savedCase,materials:hasSelection?{...materials,selection}:null,materials_invalid:false};result=savedCase;}
     else if(url==="/api/cases/main/draft"&&options.method==="PUT"){savedCase={...savedCase,draft:JSON.parse(options.body)};result=savedCase;}
     else{assert.equal(options.method,"GET");assert.ok(url in responses,"Unexpected API: "+url);result=responses[url];}
     return {ok:true,json:async()=>structuredClone(result)};},
-  localStorage:{getItem:()=>null,setItem(){}},location:{search:""},history:{replaceState(){}},URLSearchParams,
+  localStorage:{getItem:()=>null,setItem(){},removeItem(){}},location:{search:"",pathname:"/ocr"},history:{replaceState(){},pushState(){}},window:{addEventListener(){}},URLSearchParams,
   setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id),
 });
 let source=fs.readFileSync(path.join(__dirname,"../../dev/web/app.js"),"utf8");
 source=source.replace(/initialize\(\)\.catch\(error=>\{[^\n]+\}\);\s*$/, "globalThis.uiInitialized=initialize();");
 vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/results.js"),"utf8"),context);
+vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/compare.js"),"utf8"),context);
 vm.runInContext(source,context);
 const run=code=>vm.runInContext(code,context);
 (async()=>{
@@ -125,16 +126,20 @@ const run=code=>vm.runInContext(code,context);
   const results=text(get("comparison-results"))+text(get("result-overview"));assert.ok(results.includes("선택·배분한 입금액"));assert.ok(results.includes("2026-10-01"));assert.ok(!results.includes("2026-11-01"));
   run("current.analysis.comparisons=[{rule_id:'R-01',status:'difference',lhs:'14000',rhs:'13000',delta:'1000',unit:'KRW/hour',evidence_refs:[]}];renderResults()");
   assert.ok(text(get("comparison-results")).includes("명세서 단가: 14,000"));assert.ok(text(get("comparison-results")).includes("계약서 단가: 13,000"));
-  run("currentJob={id:'old-extraction',stage:'extract',status:'failed',error:'문서 유형 불일치',error_code:'MODEL_OUTPUT_INVALID',usage:{total_tokens:2961}};renderJob();switchSection('results')");
+  run("currentJob={id:'old-extraction',stage:'extract',status:'failed',error:'AI가 추출한 값의 표기를 OCR 원문에서 확인하지 못했습니다. (사유: SOURCE_VALUE_MISMATCH · 항목: 휴게 시간 (분) [break_minutes])',error_code:'MODEL_OUTPUT_INVALID',usage:{total_tokens:11650}};renderJob();switchSection('results')");
   assert.ok(!get("job-status").textContent.includes("MODEL_OUTPUT_INVALID"),"Extraction failures are displayed in the extraction panel, not as comparison failures.");
   assert.ok(get("extraction-job-status").textContent.includes("MODEL_OUTPUT_INVALID"));
+  assert.ok(get("extraction-job-status").textContent.includes("SOURCE_VALUE_MISMATCH"));
+  assert.ok(get("extraction-job-status").textContent.includes("[break_minutes]"));
+  assert.ok(get("extraction-job-status").textContent.includes("작업 ID: old-extraction"));
+  assert.ok(get("extraction-job-status").textContent.includes("11,650 토큰"));
   assert.equal(get("resume").hidden,true);assert.equal(get("extraction-resume").hidden,false);
   run("current.materials_invalid=true;pendingDraft=true;draftTimer=setTimeout(()=>{},400);updateControls()");
   assert.equal(get("confirm").disabled,true);assert.equal(get("analyze").disabled,true);
   const previousDraftCalls=requests.filter(r=>r.url.endsWith("/draft")).length;
   await run("applyMaterials()");
-  assert.equal(get("workspace").hidden,false,"Loading selected materials navigates from results to the value confirmation form.");
-  assert.equal(get("results-view").hidden,true);assert.equal(get("manual-section").open,true);
+  assert.equal(get("compare-page").hidden,false,"Loading materials stays on the comparison page with its value confirmation form.");
+  assert.equal(get("manual-section").open,true);
   assert.equal(run("currentJob"),null);assert.equal(get("resume").hidden,true);assert.equal(get("extraction-resume").hidden,true);
   assert.equal(get("extraction-job-status").hidden,true);assert.ok(!get("job-status").textContent.includes("MODEL_OUTPUT_INVALID"));
   assert.equal(requests.filter(r=>r.url.endsWith("/draft")).length,previousDraftCalls,"Invalid linked inputs are refreshed without trying to save an obsolete draft.");
@@ -192,7 +197,7 @@ const run=code=>vm.runInContext(code,context);
   assert.ok(text(get("comparison-guidance")).includes("예상 급여를 자동 계산하는 기능은 아직 없습니다"));
   assert.ok(!text(get("comparison-results")).includes("어떤 자료를 비교할까요?"));
   const confirmationButton=descendants(get("comparison-results")).find(el=>el.tagName==="button");
-  assert.equal(confirmationButton.disabled,false);confirmationButton.listeners.click();assert.equal(get("workspace").hidden,false);
+  assert.equal(confirmationButton.disabled,false);confirmationButton.listeners.click();assert.equal(get("compare-page").hidden,false);
   run("current.dirty=false;current.confirmed_revision=20;renderResults()");
   assert.ok(text(get("comparison-results")).includes("대조할 준비가 됐습니다."));assert.equal(get("analyze").disabled,false);
   responses["/api/jobs/old-job"]={id:"old-job",stage:"analyze",status:"failed",document_type:"attendance",revision:19,error_code:"OLD_FAILURE",error:"이전 대조 실패"};
@@ -204,6 +209,29 @@ const run=code=>vm.runInContext(code,context);
   assert.ok(get("job-status").textContent.includes("OLD_FAILURE"));assert.equal(get("resume").hidden,false);
   responses["/api/jobs/old-job"].stage="extract";run("delete current.materials_revision");await run("restoreCurrentJob()");
   assert.equal(run("currentJob"),null,"Existing cases without a revision marker do not restore an unrelated terminal extraction after connecting materials.");
+  context.rowFixture=structuredClone(context.fixture);
+  context.rowFixture.materials.earnings=[{item_id:"detail-pay",label:"기본급",amount:"3000000",row_role:"detail",evidence_refs:["slip-ev"]},{item_id:"subtotal-pay",label:"소계",amount:"3000000",row_role:"subtotal",evidence_refs:["slip-ev"]},{item_id:"total-pay",label:"총지급액",amount:"3000000",row_role:"total",evidence_refs:["slip-ev"]}];
+  savedCase=structuredClone(context.rowFixture);
+  run("current=rowFixture;currentJob=null;renderCase()");
+  assert.equal(run("readMaterialReview().row_roles['subtotal-pay']"),"subtotal");
+  assert.ok(text(get("statement-summary-earnings")).includes("3,000,000원"));
+  assert.ok(text(get("statement-summary-earnings")).includes("소계·총계 2개 제외"));
+  run("materialInputs.row_roles.get('detail-pay').value='excluded';changed()");
+  assert.ok(text(get("statement-summary-earnings")).includes("세부항목 없음"));
+  run("addManualStatementRow('earnings');globalThis.addedRowId=[...materialInputs.manual_rows.keys()][0];materialInputs.manual_rows.get(addedRowId).label.value='식대';materialInputs.manual_rows.get(addedRowId).amount.value='100000';changed()");
+  assert.equal(run("readMaterialReview().manual_rows[0].label"),"식대");
+  assert.equal(run("readMaterialReview().manual_rows[0].page"),1);
+  assert.ok(text(get("statement-summary-earnings")).includes("100,000원"));
+  await run("flushDraft()");run("renderCase()");
+  assert.equal(run("materialInputs.manual_rows.get(addedRowId).amount.value"),"100000","User-added rows survive saving and rendering.");
+  assert.equal(run("materialInputs.row_roles.get('detail-pay').value"),"excluded");
+  run("current.extraction_changes=[{group:'values',field_id:'contract_rate',preserved:'17000',candidate:'3000000'},{group:'',field_id:'contract_unit',preserved:'KRW/hour',candidate:'KRW/month'}];current.draft.values.contract_rate='17000';current.draft.contract_unit='KRW/hour';renderCase()");
+  assert.equal(get("extraction-changes").hidden,false);
+  const candidateButton=descendants(get("extraction-changes")).find(el=>el.tagName==="button"&&el.textContent==="새 추출값 사용");candidateButton.listeners.click();
+  assert.equal(get("value-contract_rate").value,"3000000");assert.equal(get("contract-unit").value,"KRW/month","Choosing a new rate also chooses its matching unit.");
+  const keepButton=descendants(get("extraction-changes")).find(el=>el.tagName==="button"&&el.textContent==="유지한 입력 사용");keepButton.listeners.click();
+  assert.equal(get("value-contract_rate").value,"17000");assert.equal(get("contract-unit").value,"KRW/hour");
+  assert.equal(run("statementAmount(statementCents('9999999999999.99')+statementCents('0.01'))"),"10,000,000,000,000원","Money previews preserve decimal precision.");
   assert.ok(requests.every(r=>!r.url.includes("/jobs")||r.method==="GET"),"The UI regression checks never start model or comparison jobs.");
   console.log("Comparison UI: source roles, linked contract provenance, OCR payslip, corrected deposit principal, partial allocation, distinct-transaction review, persisted review, source PDF mapping, analysis period and invalidation passed.");
 })().catch(error=>{console.error(error);process.exitCode=1;});

@@ -7,11 +7,11 @@ from jsonschema import Draft202012Validator
 from pypdf import PdfReader
 
 from agent import run_task
-from agent.dev.fixtures import confirmed_result, context, explanation_task
 from agent.graphs.explanation_graph import guard_response
 from agent.schemas.public.errors import ModelFormatError
 from agent.schemas.public.tasks import AgentOutcome, AgentTask, ReportInput
 from agent.services.hashing import content_hash, result_hash
+from agent.tests.fixtures_support import confirmed_result, context, explanation_task
 
 
 async def prepare(setup_agent):

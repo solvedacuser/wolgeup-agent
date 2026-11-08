@@ -70,3 +70,7 @@ class OCRUnavailable(AgentError):
 
 class OCRFailed(AgentError):
     code = "OCR_FAILED"
+
+
+class OCRRequired(AgentError):
+    code = "OCR_REQUIRED"

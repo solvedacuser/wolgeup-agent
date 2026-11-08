@@ -10,9 +10,9 @@ import zipfile
 import pytest
 
 from agent.config import AgentSettings
-from agent.dev.fixtures import pdf_bytes
 from agent.dev.local_workflow import ComparisonInputError, LocalStore
 from agent.dev.test_server import LocalHTTPServer
+from agent.tests.fixtures_support import pdf_bytes
 
 
 def response(kind):
@@ -84,7 +84,7 @@ class SavedDocumentProvider:
 
 
 async def stage(store, cid, name):
-    job = await store.create_job(cid, name, use_saved=False)
+    job = await store.create_job(cid, name)
     await store.tasks[job["id"]]
     result = await store.get_job(job["id"])
     assert result["status"] == "completed", result
@@ -211,34 +211,51 @@ async def test_no_contract_or_attendance_still_runs_statement_and_payment_compar
     assert results["R-06"]["status"] == "difference"
 
 
-async def test_python_ocr_payslip_flows_into_comparison_without_any_model(tmp_path, monkeypatch):
+async def test_python_ocr_then_ai_payslip_flows_into_local_comparison(tmp_path, monkeypatch):
     from agent.services import local_ocr
-
-    class NoModel:
-        async def invoke(self, *args):
-            pytest.fail("Local OCR payslip comparison must not call a model")
+    from agent.tests.support.payslip_ocr import extract_payslip
 
     lines = [
         "대상기간 2026-10-01 ~ 2026-10-31",
+        "지급내역",
         "기본급 3,000,000",
+        "소계 3,000,000",
+        "공제내역",
         "소득세 100,000",
+        "공제 소계 100,000",
         "총지급액 3,000,000",
         "공제합계 100,000",
         "실수령액 2,900,000",
     ]
+    recognized = {"text": "\n".join(lines), "lines": [{"text": line, "confidence": 95} for line in lines]}
+
+    class ClassifiedPayslip:
+        def __init__(self):
+            self.calls = []
+
+        async def invoke(self, operation, data):
+            assert operation == "extract", "Only extraction classification needs AI"
+            assert data["pages"] == [recognized["text"]]
+            assert "pdf_bytes" not in data
+            self.calls.append(operation)
+            candidate = extract_payslip([recognized])
+            candidate["document_type"] = "payslip"
+            return candidate, {}
+
     monkeypatch.setattr(
         local_ocr,
         "recognize_pdf",
-        lambda *args: [
-            {"text": "\n".join(lines), "lines": [{"text": line, "confidence": 95} for line in lines]}
-        ],
+        lambda *args: [recognized],
     )
-    store = LocalStore(AgentSettings(provider_mode="openai"), state=tmp_path, provider=NoModel())
+    provider = ClassifiedPayslip()
+    store = LocalStore(AgentSettings(provider_mode="openai"), state=tmp_path, provider=provider)
     case = await store.upload(pdf_bytes(["Synthetic scan"], scanned=True), "payslip_ocr")
     await stage(store, case["id"], "extract")
     loaded = await store.load_materials(case["id"], {"payslip_case_id": case["id"]})
+    assert [row["row_role"] for row in loaded["materials"]["earnings"]] == ["detail", "subtotal", "total"]
+    assert [row["row_role"] for row in loaded["materials"]["deductions"]] == ["detail", "subtotal", "total"]
     draft = loaded["draft"]
-    draft.update(earnings_complete=True, deductions_complete=True)
+    draft.update(time_kind="actual", earnings_complete=True, deductions_complete=True)
     await store.save_draft(case["id"], draft)
     await store.confirm(case["id"])
     job = await stage(store, case["id"], "analyze")
@@ -246,6 +263,50 @@ async def test_python_ocr_payslip_flows_into_comparison_without_any_model(tmp_pa
     assert [item["status"] for item in results[2:5]] == ["match"] * 3
     assert results[5]["status"] == "insufficient" and results[5]["rhs"] is None
     assert not job["usage"] and not job["call_budget"]
+    assert provider.calls == ["extract"]
+
+
+async def test_excluded_ocr_row_and_manual_missing_item_round_trip_into_comparison(tmp_path):
+    provider = SavedDocumentProvider()
+    candidate = response("payslip")
+    next(f for f in candidate["fields"] if f["field_id"] == "earning_2_amount")["normalized_value"] = None
+    provider.overrides["payslip"] = candidate
+    store = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
+    cases = await four_documents(store)
+    cid = cases["payslip"]
+    loaded = await store.load_materials(cid, selection({"payslip": cid}))
+    draft = loaded["draft"]
+    draft.update(time_kind="actual", earnings_complete=True, deductions_complete=True)
+    draft["material_review"]["row_roles"] = {loaded["materials"]["earnings"][1]["item_id"]: "excluded"}
+    draft["material_review"]["manual_rows"] = [
+        {
+            "row_id": "missing-meal",
+            "group": "earnings",
+            "label": "Meal allowance",
+            "amount": "22000",
+            "row_role": "detail",
+            "page": 1,
+        }
+    ]
+    await store.save_draft(cid, draft)
+    await store.confirm(cid)
+    before = list(provider.calls)
+    await stage(store, cid, "analyze")
+    analysis = store.cases[cid]["analysis"]
+    earnings = next(c for c in analysis["comparisons"] if c["rule_id"] == "R-03")
+    assert earnings["status"] == "match" and earnings["lhs"] == "112000"
+    assert provider.calls == before
+    evidence = {e["evidence_id"]: e for e in analysis["evidence_catalog"]}
+    assert any(
+        evidence[ref]["locator"] == "manual-row:missing-meal"
+        and evidence[ref]["verification_method"] == "manual_confirmed"
+        and evidence[ref]["page"] == 1
+        for ref in earnings["evidence_refs"]
+    )
+    restored = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
+    assert (await restored.get_case(cid))["draft"]["material_review"]["manual_rows"] == (
+        store.cases[cid]["draft"]["material_review"]["manual_rows"]
+    )
 
 
 async def test_explicit_source_period_mismatch_blocks_only_affected_comparisons(tmp_path):
@@ -462,7 +523,7 @@ async def test_negative_tax_refund_is_preserved_in_statement_comparison(tmp_path
 
 
 async def test_linked_sources_continue_into_explanation_report_and_original_zip(tmp_path):
-    from agent.providers.fixture_provider import FixtureProvider
+    from agent.tests.fixture_provider import FixtureProvider
 
     store = LocalStore(AgentSettings(), state=tmp_path, provider=SavedDocumentProvider())
     cases = await four_documents(store)

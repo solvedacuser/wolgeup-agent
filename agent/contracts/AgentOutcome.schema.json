@@ -393,6 +393,59 @@
           ],
           "title": "Normalized Value"
         },
+        "suggested_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Suggested Value"
+        },
+        "validation_status": {
+          "default": "valid",
+          "enum": [
+            "valid",
+            "needs_review",
+            "missing"
+          ],
+          "title": "Validation Status",
+          "type": "string"
+        },
+        "validation_reasons": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Validation Reasons",
+          "type": "array"
+        },
+        "source_quote": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Quote"
+        },
+        "source_page": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Page"
+        },
         "unit": {
           "anyOf": [
             {
@@ -491,6 +544,29 @@
             "type": "string"
           },
           "title": "Recognized Pages",
+          "type": "array"
+        },
+        "source_method": {
+          "default": "python_ocr",
+          "enum": [
+            "pdf_text",
+            "python_ocr",
+            "mixed",
+            "pdf_supplement"
+          ],
+          "title": "Source Method",
+          "type": "string"
+        },
+        "page_methods": {
+          "items": {
+            "enum": [
+              "pdf_text",
+              "python_ocr",
+              "pdf_supplement"
+            ],
+            "type": "string"
+          },
+          "title": "Page Methods",
           "type": "array"
         }
       },
@@ -737,10 +813,7 @@
       "type": "string"
     },
     "provider_mode": {
-      "enum": [
-        "fixture",
-        "openai"
-      ],
+      "const": "openai",
       "title": "Provider Mode",
       "type": "string"
     },

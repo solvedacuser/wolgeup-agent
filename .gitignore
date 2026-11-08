@@ -19,3 +19,7 @@ tools/ocr/
 *.log
 .DS_Store
 Thumbs.db
+
+.pytest-*/
+
+.playwright-cli/

@@ -3,6 +3,32 @@
 import re
 
 RATE_UNITS = ("KRW/hour", "KRW/month", "KRW/year", "KRW/day")
+STATEMENT_ROW_ROLES = ("detail", "subtotal", "total", "excluded")
+DOCUMENT_TYPES = ("contract", "attendance", "payslip", "deposit")
+
+
+def canonical_document_type(document_type):
+    """Keep old saved OCR selections readable without making OCR a document type."""
+    return "payslip" if document_type == "payslip_ocr" else document_type
+
+
+def statement_row_role(label):
+    """Recognize printed rollups without guessing from a row's amount.
+
+    Equal amounts and unfamiliar names are still separate details. These are
+    review defaults only; the user can correct the role of each preserved row.
+    """
+    key = re.sub(r"[\s:：()·/\[\]_-]", "", label or "").casefold()
+    if "소계" in key or key in {"subtotal", "부분합계", "중간합계", "과세합계", "비과세합계"}:
+        return "subtotal"
+    if (
+        key in {"합계", "총계", "총액", "total", "grosspay", "totalearnings", "totaldeductions"}
+        or key.endswith(("합계", "총계", "총액"))
+        or key.startswith("총")
+        and key.endswith(("지급액", "공제액"))
+    ):
+        return "total"
+    return "detail"
 
 
 def field(label, unit):
@@ -12,6 +38,11 @@ def field(label, unit):
 PERIOD_FIELDS = {
     "period_start": field("대상기간 시작일", "date"),
     "period_end": field("대상기간 종료일", "date"),
+}
+IDENTITY_FIELDS = {
+    "employee_name": field("근로자 성명", "text"),
+    "employee_id": field("사원번호", "text"),
+    "employer_name": field("사업장명", "text"),
 }
 PROFILES = {
     "contract": {
@@ -65,6 +96,8 @@ PROFILES = {
             "payment_date": field("지급일", "date"),
             "slip_rate": field("명세서 기재 단가", "rate"),
             "slip_minutes": field("명세서 기재 시간 (분)", "minute"),
+            "slip_actual_minutes": field("명세서 실근로시간 (분)", "minute"),
+            "slip_paid_minutes": field("명세서 지급기초·유급시간 (분)", "minute"),
             "gross": field("총지급액 (원)", "KRW"),
             "deduction": field("공제 합계 (원)", "KRW"),
             "net": field("실수령액 (원)", "KRW"),
@@ -108,10 +141,15 @@ PROFILES = {
     },
 }
 
+CONTRACT_FIELDS = dict(PROFILES["contract"]["fields"])
+for _profile in PROFILES.values():
+    _profile["fields"] = {**IDENTITY_FIELDS, **_profile["fields"]}
+
 PROFILES["payslip_ocr"] = {
     **PROFILES["payslip"],
-    "label": "급여명세서 · Python OCR",
+    "label": "급여명세서 · Python OCR + AI",
 }
+PROFILES["auto"] = {"label": "AI 문서 유형 자동 분류", "fields": {}, "rows": {}}
 
 
 def validate_document_type(document_type):
@@ -140,9 +178,19 @@ def extraction_instructions(document_type):
     """Keep stable field IDs and preserve table rows in the existing scalar field contract."""
     import json
 
-    profile = PROFILES[document_type]
+    document_type = canonical_document_type(document_type)
+    validate_document_type(document_type)
+    profile = (
+        {kind: PROFILES[kind] for kind in DOCUMENT_TYPES}
+        if document_type == "auto"
+        else PROFILES[document_type]
+    )
     instructions = (
-        " Extract this document using the following field vocabulary (unit 'rate' means one of "
+        " The source is Python OCR text and may contain recognition errors, broken columns, or omitted "
+        "characters. Never silently repair a number or invent a missing value. Preserve the exact OCR "
+        "spelling in raw_value and quote; if a value or unit is ambiguous, keep its normalized_value "
+        "null and explain the ambiguity in issues. Classify only from document content. "
+        "Extract this document using the following field vocabulary (unit 'rate' means one of "
         "KRW/hour, KRW/month, KRW/year, KRW/day, only when explicit). "
         + json.dumps(profile, ensure_ascii=False)
         + " Return every summary field once; use null raw_value/normalized_value/unit, page 1 and empty "
@@ -160,11 +208,52 @@ def extraction_instructions(document_type):
         "If a duration's unit cannot be grounded in the row or that page's heading, retain its raw "
         "value with null normalized_value and an issue instead of assuming hours or minutes. "
         "Keep every row separate in source order, including repeated dates and equal amounts. "
-        "Never encode rows in JSON strings, merge rows, or use subtotals/totals as detail rows. "
+        "Never encode rows in JSON strings or merge rows. "
         "Use exact source text for text units. Include duration units in raw_value; normalize hours "
         "to minute. Use exact quotes containing each value. Do not sum rows to create an absent total. "
+        "For employee_name, employee_id and employer_name, copy only explicit worker identity and "
+        "workplace information. Never treat an employer representative as the employee, an account "
+        "number as an employee ID, or a transfer sender as the employer without explicit evidence. "
+        "Keep absent identity fields null. For payslips distinguish actual worked time in "
+        "slip_actual_minutes from payment-basis/paid time in slip_paid_minutes. Do not combine "
+        "actual work and paid leave. Use legacy slip_minutes only if a stated total's basis is "
+        "unclear; leave it null when the explicit actual/paid fields already describe the total. "
     )
-    if document_type == "attendance":
+    if document_type == "auto":
+        instructions += (
+            " First classify the document as exactly one of contract, attendance, payslip, or deposit. "
+            "Return the actual classification in document_type and use only that type's field and table "
+            "vocabulary. A contract states agreed employment terms; attendance records actual work; "
+            "a payslip lists pay and deductions; a deposit record lists bank transfers. Filename and "
+            "selected type are hints only, never evidence. If mixed content or insufficient text prevents "
+            "a single supported classification, return document_type 'unknown', empty fields and tables, "
+            "and an issue asking the user to check or split the document. "
+        )
+    if document_type in ("contract", "auto"):
+        instructions += (
+            " For a contract return tables as [] and every contract summary field once: pay_type "
+            "(category: hourly/monthly/annual/daily), contract_rate (KRW/hour, KRW/month, KRW/year, "
+            "KRW/day), contract_start, contract_end (date), work_start, work_end (time HH:MM), "
+            "break_minutes, scheduled_daily_minutes, scheduled_weekly_minutes (minute), payday "
+            "(day_of_month: number or last_day). Each raw_value must be a short exact scalar from the "
+            "quote, not the whole sentence. Preserve explicit source units in raw_value: return "
+            "'8 hours' or '8시간', never just '8', when normalized_value is '480' and unit is minute. "
+            "Use only the amount for monetary raw_value ('3,000,000원', not '월 3,000,000원'). For "
+            "scheduled durations use '8시간' and '40시간', omitting the period labels '1일' and '1주'; "
+            "keep the complete period labels in quote. A monthly amount labelled '월 통상임금: 월 "
+            "3,000,000원' is monthly pay; raw_value may be the exact '월' marker with the full wage "
+            "quote as evidence. Normalize only explicit Korean money multipliers (300만원=3000000), "
+            "duration (1시간=60 minutes), Korean dates, and 오전/오후 clock times. Do not derive work "
+            "durations from start/end clock times or convert annual pay to monthly. Unfilled checkboxes, "
+            "zeros used as placeholders, example options, article numbers, statutory conditional break "
+            "guidance, and percentage penalties are not filled values. If annual pay is stated but "
+            "amount missing, keep annual pay_type and null contract_rate. Do not select a pay type "
+            "from unselected hourly/monthly/daily options. For conflicting schedules or only relative "
+            "payment dates return null and describe the issue. When an explicit payday has a holiday "
+            "adjustment, extract the regular payday (매월 25일 means 25) and describe the adjustment "
+            "in issues. Absent fields use page 1 and empty quote. "
+        )
+    if document_type in ("attendance", "auto"):
         instructions += (
             " Preserve explicit work dates, start/end, breaks and any stated work/overtime/night/holiday "
             "durations per row. Do not calculate durations from clock times or classify overtime by law. "
@@ -175,13 +264,16 @@ def extraction_instructions(document_type):
             "keep raw numeric cells unchanged and normalize those durations to minutes. "
             "Do not use scheduled contract hours as actual attendance. Missing cells remain null."
         )
-    elif document_type == "payslip":
+    if document_type in ("payslip", "auto"):
         instructions += (
             " Separate earnings and deductions and extract their individual names, amounts and printed "
-            "calculation text. Keep gross, total deductions and net separate from detail rows. "
+            "calculation text. Preserve printed subtotal/total rows in the corresponding earning or "
+            "deduction table with their exact labels so their calculation role can be reviewed; "
+            "they are not additional detail amounts. Also keep explicitly printed gross, total "
+            "deductions and net in the separate summary fields. Do not invent labels or row roles. "
             "Do not infer rates from amounts or missing deductions from tax rates."
         )
-    elif document_type == "deposit":
+    if document_type in ("deposit", "auto"):
         instructions += (
             " Separate deposits, withdrawals and balances on each transaction row. A balance is never "
             "a deposit amount. Preserve a printed transaction reference if present. Do not decide "

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import io
 import json
 import re
 import threading
@@ -7,15 +8,16 @@ import urllib.error
 import urllib.request
 
 import pytest
+from pypdf import PdfReader, PdfWriter
 
 from agent.config import AgentSettings
-from agent.dev.fixtures import pdf_bytes
 from agent.dev.local_workflow import LocalStore
 from agent.dev.test_server import LocalHTTPServer
 from agent.graphs.extraction_graph import verify_response
 from agent.schemas.public.errors import ModelFormatError
 from agent.services.extraction_profiles import extraction_instructions
 from agent.services.extraction_tables import expand_tables
+from agent.tests.fixtures_support import pdf_bytes
 
 
 def example_response(kind):
@@ -83,18 +85,24 @@ class DocumentProvider:
 
 @pytest.mark.parametrize("kind", ["attendance", "payslip", "deposit"])
 @pytest.mark.parametrize("scanned", [False, True])
-async def test_upload_extract_rows_and_restore_selected_type(tmp_path, kind, scanned):
+async def test_upload_extract_rows_and_restore_selected_type(tmp_path, kind, scanned, monkeypatch):
+    if scanned:
+        text = "\n".join(field["quote"] for field in example_response(kind)["fields"])
+        monkeypatch.setattr(
+            "agent.services.local_ocr.recognize_pdf",
+            lambda *_: [{"text": text, "lines": [{"text": text, "confidence": 99}]}],
+        )
     provider = DocumentProvider()
     store = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
     case = await store.upload(example_pdf(kind, scanned), kind, filename=kind + ".pdf")
     assert case["document_type"] == kind
-    job = await store.create_job(case["id"], "extract", use_saved=True)
+    job = await store.create_job(case["id"], "extract")
     await store.tasks[job["id"]]
     assert store.jobs[job["id"]]["status"] == "completed", store.jobs[job["id"]]
     assert provider.types == [kind]
     case = await store.get_case(case["id"])
     assert len(case["extraction"]["fields"]) == len(example_response(kind)["fields"])
-    assert case["extraction"]["verification_method"] == ("vision_unverified" if scanned else "text_match")
+    assert case["extraction"]["verification_method"] == ("ocr_unverified" if scanned else "text_match")
     assert case["dirty"] and case["confirmed"] is None
     assert not case["draft"]["payment_scope_confirmed"]
     assert not case["draft"]["earnings_complete"]
@@ -106,19 +114,37 @@ async def test_upload_extract_rows_and_restore_selected_type(tmp_path, kind, sca
     assert (await restored.get_case(case["id"])) == case
 
 
+async def test_image_page_with_matching_text_keeps_evidence_unverified(tmp_path):
+    reader = PdfReader(io.BytesIO(example_pdf("payslip", scanned=True)))
+    text_layer = PdfReader(io.BytesIO(example_pdf("payslip")))
+    writer, buffer = PdfWriter(), io.BytesIO()
+    writer.add_page(reader.pages[0])
+    writer.pages[0].merge_page(text_layer.pages[0])
+    writer.write(buffer)
+    store = LocalStore(AgentSettings(), state=tmp_path, provider=DocumentProvider())
+    case = await store.upload(buffer.getvalue(), "payslip")
+    job = await store.create_job(case["id"], "extract")
+    await store.tasks[job["id"]]
+    assert store.jobs[job["id"]]["status"] == "completed", store.jobs[job["id"]]
+    result = (await store.get_case(case["id"]))["extraction"]
+    assert result["verification_method"] == "ocr_unverified"
+    assert result["evidence_catalog"]
+    assert all(ref["verification_method"] == "ocr_unverified" for ref in result["evidence_catalog"])
+
+
 async def test_document_type_change_invalidates_old_candidates_and_preserves_pdf(tmp_path):
     provider = DocumentProvider()
     store = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
     data = pdf_bytes([f["quote"] for k in ("attendance", "payslip") for f in example_response(k)["fields"]])
     case = await store.upload(data, "attendance")
-    first = await store.create_job(case["id"], "extract", use_saved=False)
+    first = await store.create_job(case["id"], "extract")
     await store.tasks[first["id"]]
     changed = await store.change_document_type(case["id"], "payslip")
     assert changed["extraction"] is None and changed["draft"]["manual"] == {}
     assert changed["confirmed"] is None and changed["confirmed_revision"] is None
     assert changed["document_type_revision"] > first["revision"]
     assert store.document_data(case["document_id"]) == data
-    second = await store.create_job(case["id"], "extract", use_saved=False)
+    second = await store.create_job(case["id"], "extract")
     await store.tasks[second["id"]]
     assert store.jobs[second["id"]]["status"] == "completed"
     assert provider.types == ["attendance", "payslip"]
@@ -140,7 +166,7 @@ async def test_invalid_type_rejected_before_upload_and_active_job_cannot_change_
             return await super().invoke(operation, data)
 
     store.provider = BlockingProvider()
-    job = await store.create_job(case["id"], "extract", use_saved=False)
+    job = await store.create_job(case["id"], "extract")
     await asyncio.wait_for(entered.wait(), 3)
     try:
         with pytest.raises(ValueError):
@@ -148,17 +174,6 @@ async def test_invalid_type_rejected_before_upload_and_active_job_cannot_change_
     finally:
         release.set()
         await store.tasks[job["id"]]
-
-
-@pytest.mark.private_corpus
-async def test_contract_cache_is_not_used_for_other_document_type(tmp_path):
-    provider = DocumentProvider()
-    store = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
-    case = await store.create_case("filled-hourly", "deposit")
-    job = await store.create_job(case["id"], "extract", use_saved=True)
-    await store.tasks[job["id"]]
-    assert provider.types == ["deposit"]
-    assert "cache_source" not in store.jobs[job["id"]]
 
 
 async def test_wrong_type_asks_for_change_without_paid_automatic_retry(tmp_path):
@@ -170,13 +185,13 @@ async def test_wrong_type_asks_for_change_without_paid_automatic_retry(tmp_path)
     provider = DepositProvider()
     store = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
     case = await store.upload(example_pdf("deposit"), "contract")
-    job = await store.create_job(case["id"], "extract", use_saved=False)
+    job = await store.create_job(case["id"], "extract")
     await store.tasks[job["id"]]
     assert store.jobs[job["id"]]["status"] == "failed"
     assert "문서 유형" in store.jobs[job["id"]]["error"]
     assert provider.types == ["contract"]
     await store.change_document_type(case["id"], "deposit")
-    job = await store.create_job(case["id"], "extract", use_saved=False)
+    job = await store.create_job(case["id"], "extract")
     await store.tasks[job["id"]]
     assert store.jobs[job["id"]]["status"] == "completed"
 
@@ -185,12 +200,12 @@ def test_row_units_and_source_quotes_are_still_validated():
     response = example_response("deposit")
     bad = copy.deepcopy(response)
     bad["fields"][3]["unit"] = "minute"
-    with pytest.raises(ModelFormatError):
-        verify_response(bad, [""], "deposit", [True])
+    item = verify_response(bad, ["\n".join(f["quote"] for f in bad["fields"])], "deposit").fields[3]
+    assert item.normalized_value is None and item.validation_status == "needs_review"
     bad = copy.deepcopy(response)
     bad["fields"][3]["normalized_value"] = "1450000"
-    with pytest.raises(ModelFormatError):
-        verify_response(bad, [""], "deposit", [True])
+    item = verify_response(bad, ["\n".join(f["quote"] for f in bad["fields"])], "deposit").fields[3]
+    assert item.normalized_value is None and item.validation_status == "needs_review"
 
 
 @pytest.mark.parametrize("kind", ["attendance", "payslip", "deposit"])
@@ -225,7 +240,7 @@ def test_real_http_upload_change_type_extract_and_reload(tmp_path, kind):
         case = request("/api/uploads?document_type=contract", "POST", example_pdf(kind))
         changed = request(f"/api/cases/{case['id']}/document-type", "PUT", {"document_type": kind})
         assert changed["document_type"] == kind
-        job = request(f"/api/cases/{case['id']}/jobs", "POST", {"stage": "extract", "use_saved": True})
+        job = request(f"/api/cases/{case['id']}/jobs", "POST", {"stage": "extract"})
 
         async def completion():
             await store.tasks[job["id"]]
@@ -292,7 +307,7 @@ async def test_compact_model_tables_complete_full_upload_graph(tmp_path, kind):
 
     store = LocalStore(AgentSettings(), state=tmp_path, provider=TableProvider())
     case = await store.upload(example_pdf(kind), kind)
-    job = await store.create_job(case["id"], "extract", use_saved=False)
+    job = await store.create_job(case["id"], "extract")
     await store.tasks[job["id"]]
     assert store.jobs[job["id"]]["status"] == "completed", store.jobs[job["id"]]
     saved = store.cases[case["id"]]["extraction"]
@@ -341,8 +356,11 @@ def test_month_of_rows_keeps_source_dates_and_verifiable_heading_units():
     assert result["fields"][-1]["normalized_value"] == "480"
     assert result["fields"][0]["normalized_value"] == "10/01"
     response["tables"][0]["header_quote"] = ""
-    with pytest.raises(ModelFormatError):
-        verify_response(response, [page], "attendance")
+    checked = verify_response(response, [page], "attendance")
+    durations = [field for field in checked.fields if field.field_id.endswith("_worked_minutes")]
+    assert all(
+        field.normalized_value is None and field.validation_status == "needs_review" for field in durations
+    )
 
 
 @pytest.mark.parametrize("damage", ["header", "cells", "columns", "page"])
@@ -357,8 +375,166 @@ def test_table_adapter_rejects_unverifiable_or_misaligned_rows(damage):
         table["columns"][0] = "not_a_column"
     else:
         table["rows"][0]["page"] = 2
-    with pytest.raises(ModelFormatError):
-        verify_response(response, [page], "attendance")
+    if damage == "columns":
+        with pytest.raises(ModelFormatError):
+            verify_response(response, [page], "attendance")
+    else:
+        checked = verify_response(response, [page], "attendance")
+        assert all(
+            field.validation_status == "needs_review" and field.normalized_value is None
+            for field in checked.fields[:4]
+        )
+        assert "EXTRACTION_INCOMPLETE" in checked.issues
+
+
+def earning_table_response(rows):
+    return {
+        "document_type": "payslip",
+        "fields": [],
+        "issues": [],
+        "tables": [
+            {
+                "prefix": "earning",
+                "columns": ["label", "amount"],
+                "header_quote": "Item Amount",
+                "rows": [
+                    {
+                        "page": 1,
+                        "quote": quote,
+                        "raw_values": [label, amount],
+                        "normalized_values": [label, amount],
+                        "issues": [],
+                    }
+                    for quote, label, amount in rows
+                ],
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("amount", ["3000000", "100"])
+def test_table_cell_must_appear_on_its_own_row_before_header_expansion(amount):
+    response = earning_table_response([("Base 3000000", "Base", "3000000"), ("Meal 100000", "Meal", amount)])
+    checked = verify_response(response, ["Item Amount\nBase 3000000\nMeal 100000"], "payslip")
+    fields = {item.field_id: item for item in checked.fields}
+    item = fields["earning_2_amount"]
+    assert item.normalized_value is None and item.suggested_value == amount
+    assert "TABLE_CELL_SOURCE_MISMATCH" in item.validation_reasons
+    assert not item.evidence_valid
+    assert fields["earning_1_amount"].normalized_value == "3000000"
+    assert fields["earning_2_label"].normalized_value == "Meal"
+
+
+@pytest.mark.parametrize(
+    "quote,raw,normalized,valid",
+    [
+        ("Meal:100000", "100000", "100000", True),
+        ("Meal -100000", "-100000", "-100000", True),
+        ("Meal -100000", "100000", "100000", False),
+        ("Meal -100000", "-100", "-100", False),
+        ("Meal 100000원", "100원", "100", False),
+    ],
+)
+def test_table_scalar_boundaries_preserve_signs_and_allow_label_colons(quote, raw, normalized, valid):
+    response = earning_table_response([(quote, "Meal", raw)])
+    response["tables"][0]["rows"][0]["normalized_values"][1] = normalized
+    page = "Item Amount\n" + quote
+    if valid:
+        verify_response(response, [page], "payslip")
+    else:
+        item = verify_response(response, [page], "payslip").fields[1]
+        assert item.normalized_value is None and item.suggested_value == normalized
+        assert "TABLE_CELL_SOURCE_MISMATCH" in item.validation_reasons
+
+
+@pytest.mark.parametrize("split_tables", [False, True])
+def test_model_cannot_reuse_one_source_row_with_new_row_ids(split_tables):
+    response = earning_table_response([("Base 3000000", "Base", "3000000")] * 2)
+    if split_tables:
+        second = copy.deepcopy(response["tables"][0])
+        second["rows"] = [second["rows"].pop()]
+        response["tables"][0]["rows"].pop()
+        response["tables"].append(second)
+    checked = verify_response(response, ["Item Amount\nBase 3000000"], "payslip")
+    assert checked.fields[1].normalized_value == "3000000"
+    assert all(
+        item.normalized_value is None and "TABLE_ROW_SOURCE_REUSED" in item.validation_reasons
+        for item in checked.fields[2:]
+    )
+    assert "EXTRACTION_INCOMPLETE" in checked.issues
+
+
+def test_identical_rows_are_preserved_up_to_real_source_occurrence_count():
+    response = earning_table_response([("Base 3000000", "Base", "3000000")] * 2)
+    page = "Item Amount\nBase 3000000\nBase 3000000"
+    verify_response(response, [page], "payslip")
+    flat = expand_tables(response, [page])
+    amounts = [f for f in flat["fields"] if f["field_id"].endswith("_amount")]
+    assert len(amounts) == 2 and all(f["normalized_value"] == "3000000" for f in amounts)
+    assert len(amounts[1]["quote"]) > len(amounts[0]["quote"])
+    response["tables"][0]["rows"].append(copy.deepcopy(response["tables"][0]["rows"][0]))
+    checked = verify_response(response, [page], "payslip")
+    assert all(item.validation_status == "valid" for item in checked.fields[:4])
+    assert all(
+        item.normalized_value is None and "TABLE_ROW_SOURCE_REUSED" in item.validation_reasons
+        for item in checked.fields[4:]
+    )
+
+
+def test_identical_source_rows_on_separate_pages_are_preserved():
+    response = earning_table_response([("Base 3000000", "Base", "3000000")] * 2)
+    response["tables"][0]["rows"][1]["page"] = 2
+    pages = ["Item Amount\nBase 3000000"] * 2
+    verify_response(response, pages, "payslip")
+    flat = expand_tables(response, pages)
+    assert [f["page"] for f in flat["fields"] if f["field_id"].endswith("_amount")] == [1, 2]
+
+
+def test_image_rows_have_only_quote_consistency_not_text_occurrence_verification():
+    response = earning_table_response([("Base 3000000", "Base", "3000000")] * 2)
+    # A scanned page provides no reliable text occurrence count; confirmation remains required.
+    verify_response(response, [""], "payslip", [True])
+    response["tables"][0]["rows"][1]["raw_values"][1] = "100000"
+    item = verify_response(response, [""], "payslip", [True]).fields[3]
+    assert item.normalized_value is None and "TABLE_CELL_SOURCE_MISMATCH" in item.validation_reasons
+
+
+@pytest.mark.parametrize("copies_in_source", [1, 2])
+def test_legacy_flat_rows_also_limit_identical_quote_reuse(copies_in_source):
+    response = {
+        "document_type": "payslip",
+        "fields": [
+            {
+                "field_id": f"earning_{row_number}_{key}",
+                "raw_value": value,
+                "normalized_value": value,
+                "unit": unit,
+                "page": 1,
+                "quote": "Base 3000000",
+                "issues": [],
+            }
+            for row_number in (1, 2)
+            for key, value, unit in (("label", "Base", "text"), ("amount", "3000000", "KRW"))
+        ],
+        "issues": [],
+    }
+    page = "\n".join(["Base 3000000"] * copies_in_source)
+    if copies_in_source == 1:
+        checked = verify_response(response, [page], "payslip")
+        assert all(item.validation_status == "valid" for item in checked.fields[:2])
+        assert all(
+            item.normalized_value is None and "TABLE_ROW_SOURCE_REUSED" in item.validation_reasons
+            for item in checked.fields[2:]
+        )
+    else:
+        verify_response(response, [page], "payslip")
+
+
+def test_expanded_rows_keep_valid_overlapping_header_context():
+    response = earning_table_response([("Base 3000000", "Base", "3000000")] * 2)
+    page = "Item Amount\nBase 3000000\nBase 3000000"
+    flat = expand_tables(response, [page])
+    verify_response(flat, [page], "payslip")
 
 
 def recorded_attendance():
@@ -399,8 +575,10 @@ def test_actual_attendance_still_rejects_unproven_model_changes(damage):
         table["header_quote"] += "\n존재하지 않는 열"
     else:
         table["header_quote"] = "\n".join(reversed(table["header_quote"].splitlines()))
-    with pytest.raises(ModelFormatError):
-        verify_response(saved["response"], saved["pages"], "attendance", saved["image_pages"])
+    checked = verify_response(saved["response"], saved["pages"], "attendance", saved["image_pages"])
+    item = next(field for field in checked.fields if field.field_id == "work_1_worked_minutes")
+    assert item.validation_status == "needs_review" and item.normalized_value is None
+    assert "EXTRACTION_INCOMPLETE" in checked.issues
 
 
 def test_adjacent_note_cells_keep_real_source_separators():
@@ -414,18 +592,17 @@ def test_adjacent_note_cells_keep_real_source_separators():
     assert note["raw_value"] == note["normalized_value"] == "목 정상근무"
 
 
-async def test_replayed_source_response_is_recorded_without_new_external_usage(tmp_path):
-    store = LocalStore(
-        AgentSettings(provider_mode="openai"), state=tmp_path / "state", provider=DocumentProvider()
-    )
-    store.corpus = tmp_path / "corpus"
+async def test_classification_budget_is_saved_without_a_corpus_usage_cache(tmp_path):
+    store = LocalStore(AgentSettings(), state=tmp_path / "state", provider=DocumentProvider())
     case = await store.upload(example_pdf("attendance"), "attendance")
-    job = await store.create_job(case["id"], "extract", use_saved=False)
-    store.jobs[job["id"]]["cache_source"] = "previous paid source response"
+    job = await store.create_job(case["id"], "extract")
     await store.tasks[job["id"]]
     assert store.jobs[job["id"]]["status"] == "completed"
+    assert store.ports[job["id"]].checkpoints[job["id"]].call_budget == {"extract_candidates": 1}
+    assert store.jobs[job["id"]]["usage"] == {}
     usage = json.loads(
-        (store.corpus / "usage" / ("interactive-" + job["id"] + ".json")).read_text(encoding="utf-8")
+        (tmp_path / "state" / "usage" / ("interactive-" + job["id"] + ".json")).read_text(encoding="utf-8")
     )
-    assert usage["model_calls"] == 0 and usage["usage"] == {}
-    assert usage["call_budget"]["extract_candidates"] == 1
+    assert usage["model_calls"] == 1
+    assert usage["usage"] == {}
+    assert usage["call_budget"] == {"extract_candidates": 1}

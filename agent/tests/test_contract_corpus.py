@@ -5,7 +5,12 @@ from collections import Counter
 import pytest
 from pypdf import PdfReader
 
-from agent.dev.contract_corpus import (
+from agent.graphs.extraction_graph import verify_response
+from agent.schemas.public.tasks import AgentFailure, AgentOutcome
+from agent.services.hashing import content_hash
+from agent.services.normalization import normalize_scalar
+from agent.tests.fixtures_support import context
+from agent.tests.support.contract_corpus import (
     DEFAULT_OUTPUT,
     FIELDS,
     ROOT,
@@ -14,13 +19,7 @@ from agent.dev.contract_corpus import (
     read_json,
     select_json_sources,
 )
-from agent.dev.evaluate_corpus import score_document
-from agent.dev.fixtures import context
-from agent.graphs.extraction_graph import verify_response
-from agent.schemas.public.errors import ModelFormatError
-from agent.schemas.public.tasks import AgentFailure, AgentOutcome
-from agent.services.hashing import content_hash
-from agent.services.normalization import normalize_scalar
+from agent.tests.support.evaluate_corpus import score_document
 
 
 def compact(text):
@@ -148,8 +147,9 @@ def test_image_quote_does_not_claim_text_verification_and_text_quotes_must_match
         "issues": [],
     }
     verify_response(response, ["Small overlay only"], "contract", [True])
-    with pytest.raises(ModelFormatError):
-        verify_response(response, ["Small overlay only"], "contract", [False])
+    item = verify_response(response, ["Small overlay only"], "contract", [False]).fields[0]
+    assert item.validation_status == "needs_review" and item.normalized_value is None
+    assert not item.evidence_valid and "SOURCE_QUOTE_MISMATCH" in item.validation_reasons
 
 
 def test_failed_extraction_does_not_pass_blank_metrics():
@@ -157,7 +157,7 @@ def test_failed_extraction_does_not_pass_blank_metrics():
     outcome = AgentOutcome(
         job_id=job.job_id,
         run_id=job.run_id,
-        provider_mode="fixture",
+        provider_mode="openai",
         status="failed",
         error=AgentFailure(code="TEST", message="failed"),
     )

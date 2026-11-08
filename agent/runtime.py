@@ -34,7 +34,7 @@ class Runtime:
                             settings.ocr_page_timeout,
                         ]
                     }
-                    if getattr(task.payload, "document_type", "") == "payslip_ocr"
+                    if task.context.task_kind == "extract_document"
                     else {}
                 ),
                 "limits": [
@@ -172,5 +172,5 @@ class Runtime:
                     await self.persist()
                 if format_failures > 1:
                     raise
-                if exc.reason == "DOCUMENT_TYPE_MISMATCH":
+                if exc.reason in {"DOCUMENT_TYPE_MISMATCH", "DOCUMENT_TYPE_UNRESOLVED"}:
                     raise

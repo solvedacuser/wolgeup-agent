@@ -25,7 +25,7 @@
           "type": "string"
         },
         "engine_version": {
-          "default": "agent-0.1.0",
+          "default": "agent-0.3.0",
           "title": "Engine Version",
           "type": "string"
         }
@@ -541,8 +541,21 @@
         "source": {
           "$ref": "#/$defs/SourceRef"
         },
+        "ocr_result_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ocr Result Id"
+        },
         "document_type": {
           "enum": [
+            "auto",
             "contract",
             "attendance",
             "payslip",
@@ -553,7 +566,7 @@
           "type": "string"
         },
         "extraction_version": {
-          "default": "1.0",
+          "default": "1.2",
           "title": "Extraction Version",
           "type": "string"
         },
@@ -566,6 +579,23 @@
           "default": "luna-v1",
           "title": "Model Config Version",
           "type": "string"
+        },
+        "extraction_method": {
+          "default": "text",
+          "enum": [
+            "text",
+            "pdf_supplement"
+          ],
+          "title": "Extraction Method",
+          "type": "string"
+        },
+        "target_fields": {
+          "items": {
+            "$ref": "#/$defs/SupplementTarget"
+          },
+          "maxItems": 50,
+          "title": "Target Fields",
+          "type": "array"
         }
       },
       "required": [
@@ -1031,6 +1061,61 @@
         "evidence_refs"
       ],
       "title": "StatementItem",
+      "type": "object"
+    },
+    "SupplementTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "field_id": {
+          "maxLength": 100,
+          "minLength": 1,
+          "title": "Field Id",
+          "type": "string"
+        },
+        "page": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Page"
+        },
+        "source_quote": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source Quote"
+        },
+        "row_context": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Row Context",
+          "type": "object"
+        }
+      },
+      "required": [
+        "field_id"
+      ],
+      "title": "SupplementTarget",
       "type": "object"
     },
     "TransactionAllocation": {

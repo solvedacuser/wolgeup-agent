@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import json
 import re
+import socket
 import threading
 from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,10 +17,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
-from agent.config import AgentSettings
-from agent.dev.contract_corpus import DEFAULT_OUTPUT
-from agent.dev.evaluate_corpus import summarize
-from agent.dev.local_workflow import ComparisonInputError, LocalStore, synthetic_auxiliary
+from agent.config import ENGINE_VERSION, AgentSettings
+from agent.dev.local_workflow import LOCAL_OUTPUT, ComparisonInputError, LocalStore
 from agent.dev.pdf_preview import render_page
 from agent.services.extraction_profiles import PROFILES
 
@@ -28,12 +27,22 @@ WEB = Path(__file__).parent / "web"
 
 class LocalHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    # SO_REUSEADDR permits simultaneous listeners on Windows. An older process
+    # must never share this console's port and serve stale code or job state.
+    allow_reuse_address = (
+        False if hasattr(socket, "SO_EXCLUSIVEADDRUSE") else ThreadingHTTPServer.allow_reuse_address
+    )
 
     def __init__(self, address, store, loop):
         if address[0] != "127.0.0.1":
             raise ValueError("This tool must bind to 127.0.0.1")
         self.store, self.loop = store, loop
         super().__init__(address, Handler)
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def call(self, coroutine):
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
@@ -133,9 +142,13 @@ class Handler(BaseHTTPRequestHandler):
         store, call = self.server.store, self.server.call
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
+            "/ocr": ("index.html", "text/html; charset=utf-8"),
+            "/ai": ("index.html", "text/html; charset=utf-8"),
+            "/compare": ("index.html", "text/html; charset=utf-8"),
             "/styles.css": ("styles.css", "text/css; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/results.js": ("results.js", "text/javascript; charset=utf-8"),
+            "/compare.js": ("compare.js", "text/javascript; charset=utf-8"),
             "/preview.html": ("preview.html", "text/html; charset=utf-8"),
             "/preview.js": ("preview.js", "text/javascript; charset=utf-8"),
             "/preview.css": ("preview.css", "text/css; charset=utf-8"),
@@ -151,6 +164,8 @@ class Handler(BaseHTTPRequestHandler):
                     "provider_mode": store.settings.provider_mode,
                     "model": store.settings.extraction_model,
                     "release_ready": False,
+                    "engine_version": ENGINE_VERSION,
+                    "extraction_pipeline": "text_first_with_pdf_supplement",
                 },
             )
         if method == "GET" and path == "/api/documents":
@@ -159,9 +174,6 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, PROFILES)
         if method == "GET" and path == "/api/comparison-sources":
             return self.respond(200, {"sources": call(store.list_comparison_sources())})
-        if method == "GET" and path == "/api/evaluation":
-            report = summarize(store.corpus, save=False)
-            return self.respond(200, report)
         match = re.fullmatch(r"/api/documents/([a-z0-9-]+)/pdf", path)
         if method == "GET" and match:
             return self.respond(200, store.document_data(match[1]), "application/pdf")
@@ -173,40 +185,48 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(
                 200, render_page(store.document_data(doc_id), page, store.state / "previews"), "image/png"
             )
-        match = re.fullmatch(r"/api/documents/([a-z0-9-]+)/auxiliary", path)
-        if method == "GET" and match:
-            return self.respond(200, synthetic_auxiliary(match[1]))
         if method == "POST" and path == "/api/uploads":
             query = parse_qs(urlsplit(self.path).query)
-            document_type = query.get("document_type", ["contract"])[0]
+            document_type = query.get("document_type", ["auto"])[0]
             filename = unquote(self.headers.get("X-Document-Name", "")) or None
             return self.respond(201, call(store.upload(self.body(pdf=True), document_type, filename)))
         if method == "POST" and path == "/api/cases":
             body = self.body()
             return self.respond(
-                201, call(store.create_case(body["document_id"], body.get("document_type", "contract")))
+                201, call(store.create_case(body["document_id"], body.get("document_type", "auto")))
             )
+        if path == "/api/comparisons":
+            if method == "GET":
+                return self.respond(200, {"comparisons": call(store.list_comparisons())})
+            if method == "POST":
+                return self.respond(201, call(store.create_comparison(**self.body())))
         match = re.fullmatch(
-            r"/api/cases/([a-z0-9-]+)(?:/(draft|confirm|jobs|document-type|materials))?", path
+            r"/api/(cases|comparisons)/([a-z0-9-]+)(?:/(draft|confirm|jobs|document-type|materials|candidate-selection))?",
+            path,
         )
         if match:
-            cid, action = match.groups()
+            kind, cid, action = match.groups()
+            records = store.comparisons if kind == "comparisons" else store.cases
+            if cid not in records:
+                raise KeyError(cid)
             if method == "GET" and action is None:
-                return self.respond(200, call(store.get_case(cid)))
+                getter = store.get_comparison if kind == "comparisons" else store.get_case
+                return self.respond(200, call(getter(cid)))
             if method == "PUT" and action == "draft":
                 return self.respond(200, call(store.save_draft(cid, self.body())))
-            if method == "PUT" and action == "document-type":
+            if method == "PUT" and action == "document-type" and kind == "cases":
                 return self.respond(200, call(store.change_document_type(cid, self.body()["document_type"])))
             if method == "PUT" and action == "materials":
                 return self.respond(200, call(store.load_materials(cid, self.body())))
             if method == "POST" and action == "confirm":
                 return self.respond(200, call(store.confirm(cid)))
+            if method == "POST" and action == "candidate-selection" and kind == "cases":
+                return self.respond(200, call(store.select_candidate(cid, self.body())))
             if method == "POST" and action == "jobs":
                 body = self.body()
-                if (
-                    type(body.get("use_saved", True)) is not bool
-                    or type(body.get("include_original", False)) is not bool
-                ):
+                if set(body) - {"stage", "include_original", "field_ids", "extraction_revision"}:
+                    raise ValueError("지원하지 않는 작업 요청 항목입니다.")
+                if type(body.get("include_original", False)) is not bool:
                     raise ValueError("Boolean options required")
                 return self.respond(
                     202,
@@ -214,8 +234,9 @@ class Handler(BaseHTTPRequestHandler):
                         store.create_job(
                             cid,
                             body["stage"],
-                            use_saved=body.get("use_saved", True),
                             include_original=body.get("include_original", False),
+                            field_ids=body.get("field_ids"),
+                            extraction_revision=body.get("extraction_revision"),
                         )
                     ),
                 )
@@ -244,10 +265,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=4190)
     parser.add_argument("--env", type=Path, default=Path("agent/.env"))
-    parser.add_argument("--corpus", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--fixture", action="store_true", help="No real calls; clearly labelled fixture mode")
+    parser.add_argument("--corpus", type=Path, default=LOCAL_OUTPUT)
     args = parser.parse_args()
-    settings = AgentSettings.from_env(args.env, provider_mode="fixture" if args.fixture else "openai")
+    settings = AgentSettings.from_env(args.env, provider_mode="openai")
     loop = asyncio.new_event_loop()
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()

@@ -3,14 +3,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-ENGINE_VERSION = "agent-0.1.0"
+ENGINE_VERSION = "agent-0.3.0"
 SCHEMA_VERSION = "1.0"
 CHECKPOINT_VERSION = "1.0"
 
 
 class AgentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
-    provider_mode: Literal["fixture", "openai"] = "fixture"
+    provider_mode: Literal["openai"] = "openai"
     openai_api_key: SecretStr | None = None
     extraction_model: str = "gpt-6-luna"
     explanation_model: str = "gpt-6-luna"

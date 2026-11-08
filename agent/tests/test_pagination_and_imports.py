@@ -5,9 +5,9 @@ import sys
 from pypdf import PdfReader
 
 from agent import run_task
-from agent.dev.fixtures import confirmed_result, explanation_task
 from agent.services.hashing import result_hash
 from agent.services.reports import render_pdf
+from agent.tests.fixtures_support import confirmed_result, explanation_task
 
 
 def test_import_has_no_network_or_environment_loading():

@@ -28,12 +28,34 @@ class JobContext(ContractModel):
     requested_at: AwareDateTime
 
 
+class SupplementTarget(ContractModel):
+    field_id: str = Field(min_length=1, max_length=100)
+    page: int | None = Field(default=None, ge=1)
+    source_quote: str | None = None
+    row_context: dict[str, str | None] = Field(default_factory=dict)
+
+
 class ExtractionInput(ContractModel):
     source: SourceRef
-    document_type: Literal["contract", "attendance", "payslip", "deposit", "payslip_ocr"]
-    extraction_version: str = "1.0"
+    ocr_result_id: str | None = None
+    document_type: Literal["auto", "contract", "attendance", "payslip", "deposit", "payslip_ocr"]
+    extraction_version: str = "1.2"
     prompt_version: str = "extract-v1"
     model_config_version: str = "luna-v1"
+    extraction_method: Literal["text", "pdf_supplement"] = "text"
+    target_fields: list[SupplementTarget] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def supplement_scope(self):
+        ids = [target.field_id for target in self.target_fields]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate supplement target")
+        if self.extraction_method == "pdf_supplement":
+            if not ids or self.document_type == "auto":
+                raise ValueError("PDF supplement requires an established type and selected fields")
+        elif ids:
+            raise ValueError("Text extraction cannot include supplement targets")
+        return self
 
 
 class AnalysisJobInput(ContractModel):
@@ -91,7 +113,7 @@ class AgentOutcome(ContractModel):
     job_id: str
     run_id: str
     schema_version: str = "1.0"
-    provider_mode: Literal["fixture", "openai"]
+    provider_mode: Literal["openai"]
     status: Literal["completed", "failed", "cancelled"]
     payload: AnalysisResultCandidate | ExtractionCandidate | ExplanationCandidate | ReportCandidate | None = (
         None

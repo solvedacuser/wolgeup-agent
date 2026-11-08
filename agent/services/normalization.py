@@ -4,6 +4,18 @@ import re
 from datetime import date
 from decimal import Decimal
 
+# OCR may separate the two syllables of the Korean hour unit. Keep this
+# tolerance inside the unit grammar; never collapse arbitrary source text.
+HOUR_UNIT_PATTERN = r"(?:시\s*간|hours?|h)"
+MINUTE_UNIT_PATTERN = r"(?:분|minutes?|min)"
+DURATION_UNIT_PATTERN = rf"(?:{HOUR_UNIT_PATTERN}|{MINUTE_UNIT_PATTERN})"
+RATE_LABELS = {
+    "KRW/month": r"월(?:급|급여)?",
+    "KRW/year": r"연(?:봉)?",
+    "KRW/day": r"일(?:급|당)?",
+    "KRW/hour": r"(?:시급|시간급|시간당)",
+}
+
 CANONICAL_UNITS = {
     "pay_type": "category",
     "contract_start": "date",
@@ -22,7 +34,13 @@ def decimal_string(value):
 
 
 def money_number(raw):
-    text = re.sub(r"[\s,₩￦]", "", raw).replace("KRW", "").replace("원정", "").replace("원", "")
+    text = re.sub(r"[\s₩￦]", "", raw).replace("KRW", "").replace("원정", "").replace("원", "")
+    # A comma is a thousands separator only in a complete grouping. Removing
+    # OCR punctuation first can turn 2.888,000 into 2.888 or 2,000 21 into 200021.
+    for token in re.findall(r"\d[\d,.]*", text):
+        if "," in token and not re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", token):
+            raise ValueError("Ambiguous currency grouping")
+    text = text.replace(",", "")
     if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
         return Decimal(text)
     # Multipliers are only applied when explicitly present in the source scalar.
@@ -60,7 +78,8 @@ def normalize_scalar(raw, unit):
         if re.fullmatch(r"\d+(?:\.\d+)?", text):
             return decimal_string(Decimal(text))
         match = re.fullmatch(
-            r"\s*(?:(\d+(?:\.\d+)?)\s*(?:시간|hours?|h))?\s*(?:(\d+(?:\.\d+)?)\s*(?:분|minutes?|min))?\s*",
+            rf"\s*(?:(\d+(?:\.\d+)?)\s*{HOUR_UNIT_PATTERN})?"
+            rf"\s*(?:(\d+(?:\.\d+)?)\s*{MINUTE_UNIT_PATTERN})?\s*",
             text,
             re.I,
         )
@@ -97,6 +116,12 @@ def normalize_scalar(raw, unit):
             return str(int(match[1]))
         if text in ("말일", "매월 말일", "last day"):
             return "last_day"
+        ordinal = re.fullmatch(r"(\d{1,2})(st|nd|rd|th)", text, re.I)
+        if ordinal:
+            day = int(ordinal[1])
+            suffix = "th" if 10 <= day % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+            if 1 <= day <= 31 and ordinal[2].lower() == suffix:
+                return str(day)
         raise ValueError("Not an explicit payment day")
     if unit == "category":
         text = re.sub(r"\s+", "", text).lower()
@@ -117,14 +142,8 @@ def normalize_evidenced_scalar(raw, unit, quote, *, field_id=None):
     """Use explicit units beside the source scalar, never inferred work hours."""
     text = raw.strip()
     # Strip only a unit-compatible rate label, never a second amount or a sentence.
-    rate_labels = {
-        "KRW/month": r"월(?:급|급여)?",
-        "KRW/year": r"연(?:봉)?",
-        "KRW/day": r"일(?:급|당)?",
-        "KRW/hour": r"(?:시급|시간급|시간당)",
-    }
-    if unit in rate_labels:
-        labelled = re.fullmatch(rf"{rate_labels[unit]}\s*[:：]?\s*(.+)", text)
+    if unit in RATE_LABELS:
+        labelled = re.fullmatch(rf"{RATE_LABELS[unit]}\s*[:：]?\s*(.+)", text)
         if labelled:
             return normalize_scalar(labelled[1], unit)
     if unit == "minute":
@@ -147,12 +166,14 @@ def normalize_evidenced_scalar(raw, unit, quote, *, field_id=None):
     if unit == "minute" and re.fullmatch(r"\d+(?:\.\d+)?", text):
         # Models sometimes return the number alone while keeping the source unit in the quote.
         matches = re.finditer(
-            rf"(?<![\d.]){re.escape(text)}\s*\)?\s*(시간|hours?|h|분|minutes?|min)(?![a-z가-힣])",
+            rf"(?<![\d.,]){re.escape(text)}\s*\)?\s*({DURATION_UNIT_PATTERN})(?![a-z가-힣])",
             quote,
             re.I,
         )
         values = set()
         for match in matches:
+            if re.search(r"[+\-−]\s*\(?\s*$", quote[: match.start()]):
+                raise ValueError("Source duration sign does not match")
             source_period = re.search(r"(?:1\s*)?(일|하루|주)\s*$", quote[: match.start()])
             if source_period and expected_period and period_names[source_period[1]] != expected_period:
                 raise ValueError("Source duration period does not match field")
@@ -165,7 +186,9 @@ def normalize_evidenced_scalar(raw, unit, quote, *, field_id=None):
             return values.pop()
         if field_id and re.fullmatch(r"work_[1-9]\d*_(?:worked|overtime|night|holiday)_minutes", field_id):
             if re.search(
-                r"(?:기록\s*단위|시간\s*단위|time\s*unit)\s*[:：]\s*(?:시간|hours?|h\b)", quote, re.I
+                rf"(?:기록\s*단위|시\s*간\s*단위|time\s*unit)\s*[:：]\s*{HOUR_UNIT_PATTERN}(?![a-z가-힣])",
+                quote,
+                re.I,
             ):
                 return decimal_string(Decimal(text) * 60)
     if unit == "category" and re.sub(r"\s+", "", text) in ("월", "월통상임금"):
@@ -173,3 +196,78 @@ def normalize_evidenced_scalar(raw, unit, quote, *, field_id=None):
         if re.search(r"월\s*(?:통상임금|기본급|급여|임금)?\s*[:：]?\s*(?:월\s*)?\d[\d,.]*\s*원", quote):
             return "monthly"
     return normalize_scalar(raw, unit)
+
+
+def validate_payment_day_candidate(raw, value):
+    """Check a typed day candidate without enumerating complete sentence spellings.
+
+    Only one independent unsigned day is allowed. Explicit relative dates,
+    incompatible units, alternatives and invalid ordinal suffixes remain review
+    cases. This checks a candidate; it never confirms the OCR or the user's facts.
+    """
+    if not isinstance(value, str) or not re.fullmatch(r"[1-9]|[12]\d|3[01]", value):
+        raise ValueError("Payment day must be an integer from 1 through 31")
+    text = raw.strip()
+    if re.search(
+        r"[+\-−%％/~～]|\b(?:after|before|within|following|business|working|or)\b"
+        r"|(?:이후|이전|이내|영업일|근무일|익영업일|또는|혹은|후|전)"
+        r"|(?:원|시간|분|개월)|\b(?:hours?|minutes?|years?|KRW)\b|\d\s*(?:days?|months?)\b",
+        text,
+        re.I,
+    ):
+        raise ValueError("Payment day has relative, conflicting or incompatible context")
+    numbers = list(re.finditer(r"\d+(?:[.,]\d+)*", text))
+    if len(numbers) != 1 or numbers[0].group() != value:
+        raise ValueError("Payment day is not one exact source number")
+    token = numbers[0]
+    suffix = re.match(r"(st|nd|rd|th)\b", text[token.end() :], re.I)
+    if suffix:
+        if normalize_scalar(value + suffix[1], "day_of_month") != value:
+            raise ValueError("Invalid payment day ordinal")
+    elif re.match(r"[a-zA-Z]", text[token.end() :]):
+        raise ValueError("Payment day number is part of a different token")
+    if token.start() and re.match(r"[\d.,]", text[token.start() - 1]):
+        raise ValueError("Payment day number boundary is invalid")
+    return value
+
+
+def validate_payment_day_context(raw, quote):
+    """Reject an explicit relative-date relation around the cited day itself.
+
+    Other numbers elsewhere in a bilingual/OCR quote are not borrowed or used
+    to invalidate a separately grounded day. Holiday adjustment clauses are
+    preserved without interpreting them as a different regular payday.
+    """
+    text = re.sub(r"\s+", " ", quote)
+    scalar = re.sub(r"\s+", " ", raw.strip())
+    if not scalar:
+        return
+    for match in re.finditer(re.escape(scalar), text):
+        before, after = text[: match.start()], text[match.end() :]
+        if re.search(
+            r"\b(?:after|before|within|following|from)\s*(?:the\s*)?$|(?:이후|이전|이내|부터|후|전)\s*$",
+            before,
+            re.I,
+        ):
+            raise ValueError("Source payment day is relative to another event")
+        if re.match(
+            r"\s*(?:(?:(?:calendar|business|working)\s+)?days?\s+)?(?:after|before|within|following|from)\b"
+            r"|\s*days?\s+of\s+(?:employment|contract|work)\b"
+            r"|\s*(?:이후|이전|이내|후|전)(?:\s|에|까지|$)",
+            after,
+            re.I,
+        ):
+            raise ValueError("Source payment day is relative to another event")
+
+
+def validate_rate_unit_context(raw, unit, quote):
+    """Check only an explicit rate label immediately beside this exact value."""
+    text = re.sub(r"\s+", " ", quote)
+    scalar = re.sub(r"\s+", " ", raw.strip())
+    if not scalar:
+        return
+    for match in re.finditer(re.escape(scalar), text):
+        before = text[: match.start()]
+        for source_unit, label in RATE_LABELS.items():
+            if source_unit != unit and re.search(rf"(?<![가-힣]){label}\s*[:：]?\s*$", before):
+                raise ValueError("Explicit adjacent wage rate unit conflicts with candidate")

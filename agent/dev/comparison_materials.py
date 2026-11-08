@@ -8,6 +8,7 @@ import re
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
+from agent.dev.comparison_context import source_summary
 from agent.schemas.public.base import Period
 from agent.schemas.public.inputs import (
     EvidenceRef,
@@ -16,7 +17,13 @@ from agent.schemas.public.inputs import (
     StatementItem,
     TransactionAllocation,
 )
-from agent.services.extraction_profiles import PROFILES, RATE_UNITS
+from agent.services.extraction_profiles import (
+    CONTRACT_FIELDS,
+    RATE_UNITS,
+    STATEMENT_ROW_ROLES,
+    statement_row_role,
+)
+from agent.services.extraction_review import candidate_value, row_requires_replacement, validation_metadata
 from agent.services.hashing import digest, snapshot_hash
 
 SELECTION_TYPES = {
@@ -79,7 +86,7 @@ def _number(value, *, nullable=True, integral=False, signed=False):
 
 
 def _value(fields, field_id):
-    return fields.get(field_id, {}).get("normalized_value")
+    return candidate_value(fields.get(field_id, {}))
 
 
 def _refs(fields, *field_ids):
@@ -120,6 +127,7 @@ def _prepare_transactions(identities, warnings):
             previous["source_case_ids"] = list(
                 dict.fromkeys(previous["source_case_ids"] + row["source_case_ids"])
             )
+            previous.setdefault("validation_warnings", []).extend(row.get("validation_warnings", []))
             old_amount, new_amount = previous["transaction_amount"], row["transaction_amount"]
             equal_amounts = old_amount == new_amount or (
                 old_amount is not None
@@ -243,6 +251,7 @@ def build_materials(store, selection: dict) -> dict:
         "transactions": [],
         "evidence_catalog": [],
         "field_evidence": {},
+        "field_validation": {},
         "warnings": [],
     }
     seen_hashes, evidence_by_id, source_by_id = set(), {}, {}
@@ -255,7 +264,7 @@ def build_materials(store, selection: dict) -> dict:
         extraction = case.get("extraction")
         if kind not in SELECTION_TYPES[selection_key]:
             raise ValueError("선택 위치와 문서 유형이 일치하지 않습니다.")
-        if not extraction or extraction.get("document_type") != kind:
+        if not extraction or extraction.get("document_type") != kind or case.get("extraction_needs_review"):
             raise ValueError("선택한 자료를 먼저 현재 문서 유형으로 추출해 주세요.")
         document_id = case["document_id"]
         document = store.documents[document_id]
@@ -285,6 +294,7 @@ def build_materials(store, selection: dict) -> dict:
         result["source_versions"][case_id] = _version(case, document)
         result["sources"].append(
             {
+                **source_summary(store, case),
                 "case_id": case_id,
                 "document_id": document_id,
                 "title": document.get("title", document_id),
@@ -292,6 +302,7 @@ def build_materials(store, selection: dict) -> dict:
                 "ref": ref_json,
                 "period_start": _value(fields, "period_start"),
                 "period_end": _value(fields, "period_end"),
+                "page_count": extraction.get("page_count") or document.get("pages"),
             }
         )
         source_data.append((case_id, kind, document["sha256"], fields))
@@ -301,9 +312,33 @@ def build_materials(store, selection: dict) -> dict:
             )
 
     for case_id, kind, file_hash, fields in source_data:
+        source = next(item for item in result["sources"] if item["case_id"] == case_id)
+
+        def metadata(field):
+            return validation_metadata(field, document_id=source["document_id"], title=source["title"])
+
+        def row_warnings(row, *, required=(), row_prefix=""):
+            warnings = [
+                metadata(field) for field in row.values() if field.get("validation_status") == "needs_review"
+            ]
+            for name in required:
+                field = row.get(name, {})
+                if candidate_value(field) is None and field.get("validation_status") != "needs_review":
+                    warnings.append(
+                        metadata(
+                            {
+                                **field,
+                                "field_id": field.get("field_id", row_prefix + "_" + name),
+                                "validation_status": "missing",
+                                "validation_reasons": ["REQUIRED_VALUE_MISSING"],
+                            }
+                        )
+                    )
+            return warnings
+
         scalar_ids = []
         if kind == "contract":
-            for field_id in PROFILES["contract"]["fields"]:
+            for field_id in CONTRACT_FIELDS:
                 scalar_ids.append(field_id)
                 value = _value(fields, field_id)
                 if value is not None:
@@ -324,21 +359,44 @@ def build_materials(store, selection: dict) -> dict:
             rate_unit = fields.get("slip_rate", {}).get("unit")
             if rate_unit in RATE_UNITS:
                 result["suggested"]["slip_unit"] = rate_unit
+            actual_field = fields.get("slip_actual_minutes", {})
+            actual = candidate_value(actual_field)
+            if actual is not None or actual_field.get("validation_status") == "needs_review":
+                result["suggested"]["manual"]["slip_minutes"] = _number(actual, integral=True)
+                result["suggested"]["slip_time_kind"] = "actual" if actual is not None else ""
+                result["field_evidence"]["slip_minutes"] = _refs(fields, "slip_actual_minutes")
+                result["field_validation"]["slip_minutes"] = metadata(actual_field)
+                scalar_ids.remove("slip_minutes")
+            if "slip_paid_minutes" in fields:
+                result["field_validation"]["slip_paid_minutes"] = metadata(fields["slip_paid_minutes"])
             for prefix, output_key in (("earning", "earnings"), ("deduction", "deductions")):
                 for index, row in _rows(fields, prefix):
+                    label = (
+                        _value(row, "label") or row.get("label", {}).get("raw_value") or "항목명 확인 필요"
+                    )
+                    role = statement_row_role(_value(row, "label"))
                     result[output_key].append(
                         {
                             "item_id": prefix + "-" + digest([file_hash, prefix, index]),
-                            "label": _value(row, "label")
-                            or row.get("label", {}).get("raw_value")
-                            or "항목명 확인 필요",
+                            "label": label,
                             "amount": _number(_value(row, "amount"), signed=True),
+                            "row_role": role,
+                            "is_total": role in ("subtotal", "total"),
+                            "excluded": False,
                             "evidence_refs": _refs(row, *row),
                             "source_case_id": case_id,
+                            "validation_warnings": row_warnings(
+                                row, required=("label",), row_prefix=f"{prefix}_{index}"
+                            ),
                         }
                     )
+                    if role != "detail":
+                        result["warnings"].append(
+                            f"{label}: 소계·총계 행은 세부 항목 합계에서 제외합니다. 항목 분류를 확인해 주세요."
+                        )
         elif kind == "attendance":
             if len(selection["attendance_case_ids"]) == 1:
+                scalar_ids.append("worked_minutes")
                 value = _value(fields, "worked_minutes")
                 if value is not None:
                     result["suggested"]["manual"]["worked_minutes"] = _number(value, integral=True)
@@ -367,10 +425,22 @@ def build_materials(store, selection: dict) -> dict:
                     "account_number": account,
                     "reference": reference,
                     "duplicate_candidate_group": None,
+                    "validation_warnings": row_warnings(
+                        {
+                            key: value
+                            for key, value in row.items()
+                            if key in {"date", "description", "sender", "reference", "deposit_amount"}
+                        },
+                        required=("date",),
+                        row_prefix=f"transaction_{index}",
+                    )
+                    + row_warnings({"account_number": fields.get("account_number", {})}),
                 }
                 transaction_identities.append((transaction, account, reference))
         for field_id in scalar_ids:
             result["field_evidence"][field_id] = _refs(fields, field_id)
+            if field_id in fields:
+                result["field_validation"][field_id] = metadata(fields[field_id])
 
     period_source = next((s for s in result["sources"] if s["case_id"] == selection["payslip_case_id"]), None)
     if period_source is None and len(selection["attendance_case_ids"]) == 1:
@@ -380,6 +450,16 @@ def build_materials(store, selection: dict) -> dict:
     if period_source:
         result["suggested"]["period_start"] = period_source["period_start"]
         result["suggested"]["period_end"] = period_source["period_end"]
+        period_fields = next(
+            fields for case_id, _, _, fields in source_data if case_id == period_source["case_id"]
+        )
+        for field_id in ("period_start", "period_end"):
+            if field_id in period_fields:
+                result["field_validation"][field_id] = validation_metadata(
+                    period_fields[field_id],
+                    document_id=period_source["document_id"],
+                    title=period_source["title"],
+                )
     if len(selection["attendance_case_ids"]) > 1:
         result["warnings"].append(
             "여러 근무기록의 총 근로시간은 자동 합산하지 않습니다. 기간과 시간을 확인해 입력해 주세요."
@@ -400,7 +480,7 @@ def materials_current(store, materials) -> bool:
             return False
         for case_id, previous in versions.items():
             case = store.cases[case_id]
-            if not case.get("extraction"):
+            if not case.get("extraction") or case.get("extraction_needs_review"):
                 return False
             current = _version(case, store.documents[case["document_id"]])
             if any(current[key] != previous[key] for key in current if key != "revision"):
@@ -425,6 +505,70 @@ def _source_period(source):
     if source.get("period_start") and source.get("period_end"):
         return Period(start=source["period_start"], end=source["period_end"])
     return None
+
+
+def _manual_statement_rows(snapshot, materials, rows, manual_evidence):
+    """Keep user-added rows auditable as manual input tied to a document page."""
+    if not isinstance(rows, list) or len(rows) > 200:
+        raise ValueError("수기 보완 항목은 200개 이하의 목록이어야 합니다.")
+    source = next(
+        (s for s in materials["sources"] if s["case_id"] == materials["selection"]["payslip_case_id"]),
+        None,
+    )
+    if rows and source is None:
+        raise ValueError("수기 보완 항목의 급여명세서를 먼저 선택해 주세요.")
+    result, seen = {"earnings": [], "deductions": []}, set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) - {"row_id", "group", "label", "amount", "row_role", "page"}:
+            raise ValueError("수기 보완 항목 형식을 확인해 주세요.")
+        row_id, group, label = row.get("row_id"), row.get("group"), row.get("label")
+        role, page = row.get("row_role", "detail"), row.get("page")
+        if not isinstance(row_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", row_id) or row_id in seen:
+            raise ValueError("수기 보완 항목 식별자는 서로 달라야 합니다.")
+        seen.add(row_id)
+        if (
+            not isinstance(group, str)
+            or group not in result
+            or not isinstance(label, str)
+            or not label.strip()
+            or len(label) > 120
+        ):
+            raise ValueError("수기 보완 항목의 구분과 항목명을 확인해 주세요.")
+        if role not in STATEMENT_ROW_ROLES:
+            raise ValueError("명세서 항목 분류를 확인해 주세요.")
+        if (
+            isinstance(page, bool)
+            or not isinstance(page, int)
+            or page < 1
+            or source.get("page_count") is not None
+            and page > source["page_count"]
+        ):
+            raise ValueError("수기 보완 항목의 원문 페이지를 확인해 주세요.")
+        amount_value = row.get("amount")
+        amount = _number(None if amount_value in (None, "") else amount_value, signed=True)
+        evidence = EvidenceRef(
+            evidence_id="manual-row-"
+            + digest([source["ref"]["source_id"], row_id, label, amount, page, role]),
+            source_id=source["ref"]["source_id"],
+            page=page,
+            quote=f"사용자 보완: {label.strip()} · {amount + '원' if amount is not None else '금액 확인 필요'}",
+            locator="manual-row:" + row_id,
+            verification_method="manual_confirmed",
+        )
+        snapshot.evidence_catalog = _merge_models(
+            snapshot.evidence_catalog, [evidence], EvidenceRef, "evidence_id"
+        )
+        if role != "excluded":
+            result[group].append(
+                StatementItem(
+                    item_id="manual-" + row_id,
+                    amount=amount,
+                    evidence_refs=list(dict.fromkeys([evidence.evidence_id, *manual_evidence])),
+                    confirmed=amount is not None,
+                    is_total=role in ("subtotal", "total"),
+                )
+            )
+    return result
 
 
 def _attach_periods(snapshot, materials):
@@ -467,6 +611,8 @@ def enrich_snapshot(snapshot, materials, review: dict) -> InputSnapshot:
         "deductions",
         "transactions",
         "distinct_transactions_confirmed",
+        "row_roles",
+        "manual_rows",
     }:
         raise ValueError("자료 확인 형식을 확인해 주세요.")
     distinct_confirmed = review.get("distinct_transactions_confirmed", False)
@@ -483,7 +629,10 @@ def enrich_snapshot(snapshot, materials, review: dict) -> InputSnapshot:
             dict.fromkeys(field.evidence_refs + materials["field_evidence"].get(field.field_id, []))
         )
     if not materials["selection"]["contract_case_id"]:
-        unit = materials["suggested"].get("slip_unit")
+        confirmed_rate = next(
+            (field for field in snapshot.confirmed_fields if field.field_id == "slip_rate"), None
+        )
+        unit = confirmed_rate.unit if confirmed_rate else materials["suggested"].get("slip_unit")
         if unit in ("KRW/hour", "KRW/month"):
             snapshot.profile = "M-STD" if unit == "KRW/month" else "H-STD"
     _attach_periods(snapshot, materials)
@@ -492,6 +641,13 @@ def enrich_snapshot(snapshot, materials, review: dict) -> InputSnapshot:
         for item in snapshot.evidence_catalog
         if item.verification_method == "manual_confirmed"
     ]
+    row_roles = review.get("row_roles", {})
+    source_row_ids = {row["item_id"] for key in ("earnings", "deductions") for row in materials[key]}
+    if not isinstance(row_roles, dict) or set(row_roles) - source_row_ids:
+        raise ValueError("존재하지 않는 명세서 항목 분류입니다.")
+    if any(role not in STATEMENT_ROW_ROLES for role in row_roles.values()):
+        raise ValueError("명세서 항목 분류를 확인해 주세요.")
+    manual_rows = _manual_statement_rows(snapshot, materials, review.get("manual_rows", []), manual_evidence)
 
     for output_key in ("earnings", "deductions"):
         changes = review.get(output_key, {})
@@ -500,21 +656,42 @@ def enrich_snapshot(snapshot, materials, review: dict) -> InputSnapshot:
             raise ValueError("존재하지 않는 명세서 항목입니다.")
         if materials["selection"]["payslip_case_id"]:
             items = []
+            unresolved_rows = False
             for row in rows:
                 amount = _number(changes.get(row["item_id"], row["amount"]), signed=True)
+                role = row_roles.get(
+                    row["item_id"],
+                    row.get("row_role")
+                    or (
+                        "excluded"
+                        if row.get("excluded")
+                        else "total"
+                        if row.get("is_total")
+                        else statement_row_role(row.get("label"))
+                    ),
+                )
                 refs = list(row["evidence_refs"])
-                if row["item_id"] in changes:
+                if row["item_id"] in changes or row["item_id"] in row_roles:
                     refs = list(dict.fromkeys(refs + manual_evidence))
+                if role == "excluded":
+                    continue
+                if row_requires_replacement(row, "amount"):
+                    # A user-entered amount cannot repair an unknown label or row alignment.
+                    unresolved_rows = True
+                    amount = None
                 items.append(
                     StatementItem(
                         item_id=row["item_id"],
                         amount=amount,
                         evidence_refs=refs,
                         confirmed=amount is not None,
+                        is_total=role in ("subtotal", "total"),
                     )
                 )
+            items.extend(manual_rows[output_key])
             setattr(snapshot, output_key, items)
-            if not items or any(item.amount is None for item in items):
+            details = [item for item in items if not item.is_total]
+            if unresolved_rows or not details or any(item.amount is None for item in details):
                 setattr(snapshot, output_key + "_complete", False)
 
     changes = review.get("transactions", {})
@@ -536,6 +713,9 @@ def enrich_snapshot(snapshot, materials, review: dict) -> InputSnapshot:
         if amount is not None and original is not None and Decimal(amount) > Decimal(original):
             raise ValueError("배분 금액이 원문 입금액을 초과합니다.")
         if selected:
+            if row_requires_replacement(row, "deposit_amount"):
+                unresolved = True
+                continue
             if duplicate_groups[row["transaction_id"]]:
                 selected_candidates.setdefault(duplicate_groups[row["transaction_id"]], set()).add(
                     row["transaction_id"]

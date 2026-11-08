@@ -77,6 +77,11 @@ class ExtractedField(ContractModel):
     field_id: str
     raw_value: str | None
     normalized_value: str | None
+    suggested_value: str | None = None
+    validation_status: Literal["valid", "needs_review", "missing"] = "valid"
+    validation_reasons: list[str] = Field(default_factory=list)
+    source_quote: str | None = None
+    source_page: int | None = None
     unit: str | None
     evidence_refs: list[str]
     issues: list[str] = Field(default_factory=list)
@@ -94,6 +99,8 @@ class ExtractionCandidate(ContractModel):
     page_count: int
     verification_method: Literal["text_match", "vision_unverified", "ocr_unverified"]
     recognized_pages: list[str] = Field(default_factory=list)
+    source_method: Literal["pdf_text", "python_ocr", "mixed", "pdf_supplement"] = "python_ocr"
+    page_methods: list[Literal["pdf_text", "python_ocr", "pdf_supplement"]] = Field(default_factory=list)
 
 
 class ExplanationCandidate(ContractModel):

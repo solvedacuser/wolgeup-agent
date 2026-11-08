@@ -6,12 +6,12 @@ import pytest
 
 from agent import run_task
 from agent.config import AgentSettings
-from agent.dev.fake_ports import FakePorts
-from agent.dev.fixtures import context, pdf_bytes, source
 from agent.graphs.extraction_graph import verify_response
 from agent.schemas.public.errors import ModelFormatError
 from agent.schemas.public.tasks import AgentTask, ExtractionInput
 from agent.services.normalization import normalize_evidenced_scalar, normalize_scalar
+from agent.tests.fake_ports import FakePorts
+from agent.tests.fixtures_support import context, pdf_bytes, source
 
 
 def captured_response():
@@ -93,7 +93,7 @@ def test_bare_scalar_keeps_minutes_and_does_not_infer_from_other_numbers():
 def test_captured_model_response_passes_without_editing_source_values():
     response = captured_response()
     original = deepcopy(response)
-    verify_response(response, [""], "contract", [True])
+    verify_response(response, ["\n".join(field["quote"] for field in response["fields"])], "contract")
     assert response == original
 
 
@@ -101,18 +101,30 @@ def test_captured_model_response_passes_without_editing_source_values():
 def test_incorrect_normalized_values_still_fail(index, bad_value):
     response = captured_response()
     response["fields"][index]["normalized_value"] = bad_value
-    with pytest.raises(ModelFormatError) as error:
-        verify_response(response, [""], "contract", [True])
-    assert error.value.reason == "SOURCE_NORMALIZATION_INVALID"
-    assert error.value.field_id == response["fields"][index]["field_id"]
+    checked = verify_response(
+        response, ["\n".join(field["quote"] for field in response["fields"])], "contract"
+    )
+    item = checked.fields[index]
+    assert item.validation_status == "needs_review"
+    assert item.normalized_value is None and item.suggested_value == bad_value
+    assert "SOURCE_NORMALIZATION_INVALID" in item.validation_reasons
+    assert all(
+        field.validation_status == "valid" for other, field in enumerate(checked.fields) if other != index
+    )
 
 
-async def test_scanned_contract_completes_with_previously_rejected_response():
+async def test_scanned_contract_completes_with_previously_rejected_response(monkeypatch):
     response = captured_response()
+    text = "\n".join(field["quote"] for field in response["fields"])
+    monkeypatch.setattr(
+        "agent.services.local_ocr.recognize_pdf",
+        lambda *_: [{"text": text, "lines": [{"text": text, "confidence": 99}]}],
+    )
     data = pdf_bytes([field["quote"] for field in response["fields"]], scanned=True)
     ref = source(data)
     task = AgentTask(
-        context=context("extract_document"), payload=ExtractionInput(source=ref, document_type="contract")
+        context=context("extract_document"),
+        payload=ExtractionInput(ocr_result_id="test-ocr-1", source=ref, document_type="contract"),
     )
     ports = FakePorts()
     ports.bind(task.context)
@@ -123,20 +135,22 @@ async def test_scanned_contract_completes_with_previously_rejected_response():
 
         async def invoke(self, operation, data):
             self.calls += 1
-            assert operation == "extract" and data["pdf_bytes"]
+            assert operation == "extract" and data["source_method"] == "python_ocr"
+            assert "pdf_bytes" not in data
+            assert data["pages"] == [text]
             return deepcopy(response), {}
 
     provider = RecordedProvider()
     outcome = await run_task(task, ports=ports, settings=AgentSettings(), provider=provider)
     assert outcome.status == "completed", outcome.error
     assert provider.calls == 1
-    assert outcome.payload.verification_method == "vision_unverified"
+    assert outcome.payload.verification_method == "ocr_unverified"
     assert {f.field_id: f.normalized_value for f in outcome.payload.fields} == {
         "pay_type": "monthly",
         "scheduled_daily_minutes": "480",
         "scheduled_weekly_minutes": "2400",
     }
-    assert "VISION_REQUIRES_USER_CONFIRMATION" in outcome.payload.issues
+    assert "OCR_REQUIRES_USER_CONFIRMATION" in outcome.payload.issues
 
 
 async def test_retry_receives_safe_feedback_and_preserves_usage_and_budget():
@@ -226,7 +240,10 @@ def test_second_real_monthly_scan_response_passes_unchanged():
     response = json.loads(path.read_text(encoding="utf-8"))
     original = deepcopy(response)
     assert len(response["fields"]) == 10
-    verify_response(response, ["", ""], "contract", [True, True])
+    pages = [
+        "\n".join(field["quote"] for field in response["fields"] if field["page"] == page) for page in (1, 2)
+    ]
+    verify_response(response, pages, "contract")
     assert response == original
 
 
@@ -262,8 +279,21 @@ async def test_private_pending_response_recovers_without_another_call_or_budget_
             return deepcopy(invalid_response), {"total_tokens": 9}
 
     provider = PreviouslyInvalidProvider()
-    failed = await run_task(task, ports=ports, settings=settings, provider=provider)
-    assert failed.status == "failed" and failed.error.code == "MODEL_OUTPUT_INVALID"
+    # Exercise the runtime's structural-response retry/recovery contract directly.
+    # A scalar normalization mismatch now produces a review candidate, not a failed job.
+    from agent.runtime import Runtime
+
+    initial = Runtime(task, ports, settings, provider)
+    await initial.start([task.payload.source])
+
+    def previous_validator(response):
+        raise ModelFormatError("Invalid extraction schema")
+
+    async def original_call():
+        return await initial.call_model("extract_candidates", "extract", {}, validator=previous_validator)
+
+    with pytest.raises(ModelFormatError):
+        await initial.step("extract_candidates", original_call)
     assert provider.calls == 2
     checkpoint = ports.checkpoints[task.context.job_id]
     assert (
@@ -272,8 +302,6 @@ async def test_private_pending_response_recovers_without_another_call_or_budget_
     original_budget = dict(checkpoint.call_budget)
 
     # Exercise a corrected validator on the same protected checkpoint after process restart.
-    from agent.runtime import Runtime
-
     restarted = FakePorts(directory=tmp_path)
     restarted.bind(task.context)
     restarted.add_source(task.payload.source, data)

@@ -4,24 +4,24 @@ import pytest
 
 from agent import run_task
 from agent.config import AgentSettings
-from agent.dev.fake_ports import FakePorts
-from agent.dev.fixtures import context, pdf_bytes, source
 from agent.graphs.extraction_graph import verify_response
-from agent.providers.fixture_provider import FixtureProvider
 from agent.schemas.public.errors import (
     DependencyUnavailable,
     ExecutionRevoked,
-    ModelFormatError,
     ModelTransientError,
 )
 from agent.schemas.public.tasks import AgentTask, ExtractionInput
+from agent.tests.fake_ports import FakePorts
+from agent.tests.fixture_provider import FixtureProvider
+from agent.tests.fixtures_support import context, pdf_bytes, source
 
 
 def extraction_task(data=None):
     data = data or pdf_bytes(["SYNTHETIC PAYSLIP", "gross: 2000000 KRW"])
     ref = source(data, status="pending")
     task = AgentTask(
-        context=context("extract_document"), payload=ExtractionInput(source=ref, document_type="payslip")
+        context=context("extract_document"),
+        payload=ExtractionInput(ocr_result_id="test-ocr-1", source=ref, document_type="payslip"),
     )
     ports = FakePorts()
     ports.bind(task.context)
@@ -34,7 +34,8 @@ async def test_fixture_extraction_has_grounded_quote():
     out = await run_task(task, ports=ports, settings=settings)
     assert out.status == "completed", out.error
     assert out.payload.fields[0].normalized_value == "2000000"
-    assert out.payload.verification_method == "text_match"
+    assert out.payload.verification_method == "ocr_unverified"
+    assert "gross: 2000000 KRW" in out.payload.recognized_pages[0]
     assert out.payload.evidence_catalog[0].page == 1
     assert sum(ports.checkpoints[task.context.job_id].call_budget.values()) == 1
 
@@ -59,8 +60,13 @@ def test_extraction_rejects_invented_evidence(mutation):
         item["normalized_value"] = "200"
     else:
         response["fields"].append(dict(item))
-    with pytest.raises(ModelFormatError):
-        verify_response(response, ["gross: 100 KRW"], "payslip")
+    checked = verify_response(response, ["gross: 100 KRW"], "payslip")
+    assert len(checked.fields) == 1
+    item = checked.fields[0]
+    assert item.validation_status == "needs_review" and item.normalized_value is None
+    assert item.validation_reasons
+    if mutation in ("page", "quote"):
+        assert not item.evidence_valid
 
 
 async def test_damage_and_size_limits_do_not_call_model():
@@ -211,7 +217,7 @@ async def test_parallel_save_collects_all_four_workers(setup_agent):
 
 
 def test_synthetic_fixture_pdf_is_reproducible():
-    from agent.dev.fixtures import analysis_fixture
+    from agent.tests.fixtures_support import analysis_fixture
 
     first, _, first_bytes = analysis_fixture()
     second, _, second_bytes = analysis_fixture()
@@ -220,7 +226,7 @@ def test_synthetic_fixture_pdf_is_reproducible():
 
 
 async def test_demo_can_resume_after_rebuilding_fixtures(tmp_path):
-    from agent.dev.run_fixture import demo
+    from agent.tests.support.run_fixture import demo
 
     await demo(tmp_path)
     first_pdf = (tmp_path / "summary.pdf").read_bytes()

@@ -14,9 +14,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pypdf import PdfReader
 
 from agent import run_task
-from agent.dev.contract_corpus import DEFAULT_OUTPUT, FIELDS, read_json, write_json
-from agent.dev.fake_ports import FakePorts
+from agent.config import ENGINE_VERSION
+from agent.dev.candidate_selection import (
+    clear_candidates,
+    initialize_candidates,
+    select_candidate,
+    supplement_entry,
+    supplement_targets,
+    validate_supplement_lineage,
+)
+from agent.ports.local import LocalFilePorts
 from agent.schemas.public.base import Period
+from agent.schemas.public.errors import AgentError, IntegrityError, JobCancelled
 from agent.schemas.public.inputs import (
     ConfirmedField,
     EvidenceRef,
@@ -34,9 +43,14 @@ from agent.schemas.public.tasks import (
     JobContext,
     ReportInput,
 )
-from agent.services.extraction_profiles import validate_document_type
+from agent.services.extraction_profiles import CONTRACT_FIELDS, validate_document_type
+from agent.services.extraction_review import candidate_value, row_requires_replacement
 from agent.services.facts import allowed_facts
-from agent.services.hashing import content_hash, snapshot_hash
+from agent.services.hashing import content_hash, digest, snapshot_hash
+from agent.services.local_json import read_json, write_json
+
+LOCAL_OUTPUT = Path(__file__).resolve().parents[2] / "output/document-workspace"
+FIELDS = CONTRACT_FIELDS
 
 MANUAL_FIELDS = (
     "slip_rate",
@@ -73,10 +87,34 @@ class ReviewedTransaction(BaseModel):
         return value
 
 
+class ReviewedStatementRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    row_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")
+    group: Literal["earnings", "deductions"]
+    label: str = Field(default="", max_length=120)
+    amount: str | None = None
+    row_role: Literal["detail", "subtotal", "total", "excluded"] = "detail"
+    page: int = Field(ge=1)
+
+    @field_validator("label")
+    @classmethod
+    def row_label(cls, value):
+        return value.strip()
+
+    @field_validator("amount")
+    @classmethod
+    def row_amount(cls, value):
+        if value not in (None, "") and not re.fullmatch(r"-?\d{1,13}(?:\.\d{1,2})?", value):
+            raise ValueError("Row amount must be a decimal string")
+        return value
+
+
 class MaterialReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
     earnings: dict[str, str | None] = Field(default_factory=dict)
     deductions: dict[str, str | None] = Field(default_factory=dict)
+    row_roles: dict[str, Literal["detail", "subtotal", "total", "excluded"]] = Field(default_factory=dict)
+    manual_rows: list[ReviewedStatementRow] = Field(default_factory=list, max_length=200)
     transactions: dict[str, ReviewedTransaction] = Field(default_factory=dict)
     distinct_transactions_confirmed: bool = False
 
@@ -91,6 +129,18 @@ class MaterialReview(BaseModel):
         return values
 
 
+class SourceIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    employee_name: str = Field(default="", max_length=160)
+    employee_id: str = Field(default="", max_length=160)
+    employer_name: str = Field(default="", max_length=160)
+
+    @field_validator("employee_name", "employee_id", "employer_name", mode="before")
+    @classmethod
+    def clean_identity(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
 class Confirmation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     values: dict[str, str | None] = Field(default_factory=dict)
@@ -101,10 +151,13 @@ class Confirmation(BaseModel):
     period_end: str = ""
     manual: dict[str, str | None] = Field(default_factory=dict)
     time_kind: Literal["", "actual", "paid"] = ""
+    worked_time_kind: Literal["", "actual", "paid"] = ""
+    slip_time_kind: Literal["", "actual", "paid"] = ""
+    subjects_confirmed: bool = False
+    source_identity: dict[str, SourceIdentity] = Field(default_factory=dict)
     earnings_complete: bool = False
     deductions_complete: bool = False
     payment_scope_confirmed: bool = False
-    synthetic_auxiliary: bool = False
     material_review: MaterialReview = Field(default_factory=MaterialReview)
 
     @field_validator("manual")
@@ -149,58 +202,95 @@ class Confirmation(BaseModel):
             raise ValueError("Both analysis period dates are required")
         if self.period_start:
             Period(start=self.period_start, end=self.period_end)
-        if (
-            any(self.manual.get(k) not in (None, "") for k in ("worked_minutes", "slip_minutes"))
-            and not self.time_kind
+        for field_id, time_kind in (
+            ("worked_minutes", self.worked_time_kind),
+            ("slip_minutes", self.slip_time_kind),
         ):
-            raise ValueError("Time basis actual/paid must be confirmed")
+            if self.manual.get(field_id) not in (None, "") and not (time_kind or self.time_kind):
+                raise ValueError("Time basis actual/paid must be confirmed for each source")
         if self.manual.get("slip_rate") not in (None, "") and not self.slip_unit:
             raise ValueError("Statement rate unit must be confirmed")
         return self
 
 
-def synthetic_auxiliary(doc_id):
-    if doc_id not in ("filled-hourly", "filled-monthly", "filled-missing"):
-        raise ValueError("Synthetic auxiliary data is available for filled test samples only")
-    base = {
-        "period_start": "2026-10-01",
-        "period_end": "2026-10-31",
-        "time_kind": "actual",
-        "synthetic_auxiliary": True,
-        "contract_period_confirmed": True,
-        "earnings_complete": True,
-        "deductions_complete": True,
-        "payment_scope_confirmed": True,
-    }
-    if doc_id == "filled-hourly":
-        base["slip_unit"] = "KRW/hour"
-        base["manual"] = {
-            "slip_rate": "14000",
-            "worked_minutes": "480",
-            "slip_minutes": "480",
-            "gross": "112000",
-            "deduction": "0",
-            "net": "112000",
-            "deposit": "112000",
-            "earning_item": "112000",
-            "deduction_item": "0",
+def extraction_draft(payload):
+    """Keep generated candidates separate from the user's working confirmation."""
+    data = payload if isinstance(payload, dict) else payload.model_dump(mode="json")
+    fields = {field["field_id"]: field for field in data.get("fields", [])}
+    draft = Confirmation().model_dump()
+    draft["values"] = {key: candidate_value(field) for key, field in fields.items() if key in FIELDS}
+    if data.get("document_type") != "contract":
+        draft["manual"] = {
+            key: candidate_value(field)
+            for key, field in fields.items()
+            if key in MANUAL_FIELDS and candidate_value(field) is not None
         }
-    elif doc_id == "filled-monthly":
-        base["slip_unit"] = "KRW/month"
-        base["manual"] = {
-            "slip_rate": "3000000",
-            "gross": "3000000",
-            "deduction": "300000",
-            "net": "2700000",
-            "deposit": "2600000",
-            "earning_item": "3000000",
-            "deduction_item": "300000",
-        }
-    else:
-        base.update(
-            manual={}, earnings_complete=False, deductions_complete=False, payment_scope_confirmed=False
+        if (
+            data.get("document_type") == "deposit"
+            and candidate_value(fields.get("deposit_total", {})) is not None
+        ):
+            draft["manual"]["deposit"] = candidate_value(fields["deposit_total"])
+        for key in ("period_start", "period_end"):
+            if candidate_value(fields.get(key, {})):
+                draft[key] = candidate_value(fields[key])
+        if fields.get("slip_rate", {}).get("unit") in ("KRW/hour", "KRW/month", "KRW/year", "KRW/day"):
+            draft["slip_unit"] = fields["slip_rate"]["unit"]
+        actual_field = fields.get("slip_actual_minutes", {})
+        actual_minutes = candidate_value(actual_field)
+        if actual_minutes is not None or actual_field.get("validation_status") == "needs_review":
+            draft["manual"]["slip_minutes"] = actual_minutes
+            draft["slip_time_kind"] = "actual" if actual_minutes is not None else ""
+    if fields.get("contract_rate", {}).get("unit") in ("KRW/hour", "KRW/month", "KRW/year", "KRW/day"):
+        draft["contract_unit"] = fields["contract_rate"]["unit"]
+    return draft
+
+
+def merge_extraction_draft(current, baseline, candidate, confirmed=None):
+    """Refresh untouched candidates while preserving edited, cleared, and confirmed values."""
+    draft, changes = copy.deepcopy(current), []
+
+    def empty(value):
+        return None if value in (None, "") else value
+
+    def protected(group, key):
+        before = baseline.get(group, {}) if group else baseline
+        target = current.get(group, {}) if group else current
+        locked = (confirmed or {}).get(group, {}) if group else confirmed or {}
+        value = target.get(key)
+        return empty(value) != empty(before.get(key)) or (
+            empty(value) is not None and empty(locked.get(key)) == empty(value)
         )
-    return base
+
+    paired = set()
+    for group, rate, unit in (
+        ("values", "contract_rate", "contract_unit"),
+        ("manual", "slip_rate", "slip_unit"),
+        ("manual", "worked_minutes", "worked_time_kind"),
+        ("manual", "slip_minutes", "slip_time_kind"),
+    ):
+        if protected(group, rate) or protected("", unit):
+            paired.update(((group, rate), ("", unit)))
+
+    def merge(group, keys):
+        incoming = candidate.get(group, {}) if group else candidate
+        target = draft.setdefault(group, {}) if group else draft
+        for key in sorted(keys):
+            new, value = incoming.get(key), target.get(key)
+            if protected(group, key) or (group, key) in paired:
+                if empty(value) != empty(new):
+                    changes.append({"group": group, "field_id": key, "preserved": value, "candidate": new})
+            else:
+                target[key] = new
+
+    for group in ("values", "manual"):
+        merge(group, set(baseline.get(group, {})) | set(candidate.get(group, {})))
+    merge(
+        "", ("contract_unit", "slip_unit", "period_start", "period_end", "worked_time_kind", "slip_time_kind")
+    )
+    # New rows and transactions always need a fresh completeness/scope confirmation.
+    for key in ("earnings_complete", "deductions_complete", "payment_scope_confirmed"):
+        draft[key] = False
+    return Confirmation.model_validate(draft).model_dump(), changes
 
 
 def make_snapshot(case, document_ref, confirmation):
@@ -221,9 +311,7 @@ def make_snapshot(case, document_ref, confirmation):
     evidence = EvidenceRef(
         evidence_id=identifier("confirmed"),
         source_id=manual_ref.source_id,
-        quote="사용자가 확인한 가상 보조자료"
-        if confirmation.synthetic_auxiliary
-        else "사용자가 확인한 수기 입력",
+        quote="사용자가 확인한 수기 입력",
         verification_method="manual_confirmed",
     )
     fields = []
@@ -257,7 +345,17 @@ def make_snapshot(case, document_ref, confirmation):
                     if key != "contract_rate" or confirmation.contract_period_confirmed
                     else None
                 ),
-                time_kind=confirmation.time_kind or None if value_unit == "minute" else None,
+                time_kind=(
+                    (
+                        confirmation.worked_time_kind
+                        if key == "worked_minutes"
+                        else confirmation.slip_time_kind
+                    )
+                    or confirmation.time_kind
+                    or None
+                )
+                if value_unit == "minute"
+                else None,
             )
         )
     manual = confirmation.manual
@@ -270,7 +368,7 @@ def make_snapshot(case, document_ref, confirmation):
         period=period,
         profile="M-STD" if unit == "KRW/month" else "H-STD",
         confirmed_fields=fields,
-        authorized_sources=[document_ref, manual_ref],
+        authorized_sources=([document_ref] if document_ref is not None else []) + [manual_ref],
         evidence_catalog=[evidence],
         earnings=[
             StatementItem(
@@ -304,7 +402,7 @@ def make_snapshot(case, document_ref, confirmation):
     return snapshot, manual_ref, manual_data
 
 
-class LocalPorts(FakePorts):
+class LocalPorts(LocalFilePorts):
     def __init__(self, store, job):
         super().__init__(directory=store.state / "artifacts-and-checkpoints")
         self.store, self.job = store, job
@@ -315,41 +413,97 @@ class LocalPorts(FakePorts):
         self.job["events"].append(event.model_dump(mode="json"))
         self.store.save_job(self.job)
 
+    async def read_ocr(self, context, source, ocr_result_id):
+        await self.check_access(context, [source])
+        case = self.store.cases.get(context.case_id)
+        result = case.get("ocr") if case else None
+        if (
+            not result
+            or case["document_id"] != source.document_id
+            or self.store.document_ref(case["document_id"]) != source
+            or result.get("id") != ocr_result_id
+            or result.get("document_id") != source.document_id
+            or result.get("document_version") != source.document_version
+            or result.get("content_hash") != source.content_hash
+        ):
+            raise IntegrityError("저장된 OCR 결과와 문서 버전이 다릅니다. OCR을 다시 실행해 주세요.")
+        self.store.document_data(case["document_id"])
+        return copy.deepcopy(result)
+
 
 class LocalStore:
-    def __init__(self, settings, *, corpus=DEFAULT_OUTPUT, state=None, provider=None, origin="local_console"):
+    def __init__(self, settings, *, corpus=LOCAL_OUTPUT, state=None, provider=None, origin="local_console"):
         self.settings, self.corpus, self.provider = settings, Path(corpus), provider
         self.origin = origin
-        self.state = Path(state) if state else self.corpus / "local-state"
-        for folder in ("cases", "jobs", "uploads", "artifacts-and-checkpoints"):
+        self.state = Path(state) if state else self.corpus
+        for folder in ("cases", "comparisons", "jobs", "uploads", "artifacts-and-checkpoints"):
             (self.state / folder).mkdir(parents=True, exist_ok=True)
-        manifest_path = self.corpus / "manifest.json"
-        if not manifest_path.exists():
-            write_json(manifest_path, {"version": "local-empty-v1", "count": 0, "documents": []})
-        self.documents = {d["id"]: d for d in read_json(manifest_path)["documents"]}
+        documents_path = self.state / "documents.json"
+        self.documents = read_json(documents_path) if documents_path.exists() else {}
         self.cases = {p.stem: read_json(p) for p in (self.state / "cases").glob("*.json")}
+        self.comparisons = {p.stem: read_json(p) for p in (self.state / "comparisons").glob("*.json")}
         self.jobs = {p.stem: read_json(p) for p in (self.state / "jobs").glob("*.json")}
         self.tasks, self.ports = {}, {}
         self.current_tokens, self.job_owners = {}, {}
         self.semaphore = asyncio.Semaphore(2)
-        for case in self.cases.values():
+        for case in self._all_records():
+            case.setdefault("ocr", None)
             case.setdefault("document_type_revision", 1)
             case.setdefault("document_type", (case.get("extraction") or {}).get("document_type", "contract"))
             case.setdefault("extraction_revision", 1 if case.get("extraction") else 0)
+            initialize_candidates(case)
             case.setdefault("materials", None)
             case.setdefault("materials_revision", 0)
             case.setdefault("confirmed_materials", None)
             case.setdefault("materials_invalid", False)
             case.setdefault("analysis_history", [])
-            if case.get("upload"):
-                self.documents[case["document_id"]] = case["upload"]
+            case.setdefault("extraction_changes", [])
+            case.setdefault("draft_history", [])
+            case["extraction_needs_review"] = bool(
+                case.get("extraction") and case.get("extraction_engine_version") != ENGINE_VERSION
+            )
+            if case.get("analysis") and case["analysis"].get("engine_version") != ENGINE_VERSION:
+                case.update(stale=True, explanation=None, report=None)
         for job in self.jobs.values():
             if job["status"] in ("queued", "running"):
                 job.update(status="interrupted", error="서버가 중단되었습니다. 이어서 실행할 수 있습니다.")
                 self.save_job(job)
 
     def save_case(self, case):
-        write_json(self.state / "cases" / (case["id"] + ".json"), case)
+        folder = "comparisons" if case.get("kind") == "comparison" else "cases"
+        write_json(self.state / folder / (case["id"] + ".json"), case)
+
+    def _record(self, record_id):
+        return self.comparisons[record_id] if record_id in self.comparisons else self.cases[record_id]
+
+    def _all_records(self):
+        return (*self.cases.values(), *self.comparisons.values())
+
+    def _record_view(self, case):
+        result = copy.deepcopy(case)
+        if case.get("kind") == "comparison":
+            from agent.dev.comparison_context import comparison_compatibility
+
+            result["compatibility"] = comparison_compatibility(case.get("materials"), case["draft"])
+        return result
+
+    def _validate_comparison_context(self, case, confirmation):
+        if case.get("kind") != "comparison":
+            return
+        from agent.dev.comparison_context import comparison_compatibility
+
+        compatibility = comparison_compatibility(case.get("materials"), confirmation.model_dump())
+        blocking = next(
+            (issue for issue in compatibility.get("issues", []) if issue.get("severity") == "blocking"), None
+        )
+        if blocking or compatibility.get("blocked"):
+            raise ComparisonInputError(
+                (blocking or {}).get("message") or "선택한 자료의 근로자·사업장·대상기간을 확인해 주세요."
+            )
+        if not confirmation.subjects_confirmed:
+            raise ComparisonInputError(
+                "같은 근로자·사업장에 관한 자료인지 원문과 확인한 뒤 대조에 반영해 주세요."
+            )
 
     def save_job(self, job):
         write_json(self.state / "jobs" / (job["id"] + ".json"), job)
@@ -371,35 +525,20 @@ class LocalStore:
         return case
 
     def _invalidate_material_dependents(self, source_case_id):
-        for dependent in self.cases.values():
+        for dependent in self._all_records():
             if source_case_id in (dependent.get("materials") or {}).get("source_versions", {}):
                 self._refresh_materials(dependent)
 
     async def list_comparison_sources(self):
-        result = []
-        for case in self.cases.values():
-            fields = {
-                f["field_id"]: f.get("normalized_value")
-                for f in (case.get("extraction") or {}).get("fields", [])
-            }
-            result.append(
-                {
-                    "case_id": case["id"],
-                    "document_id": case["document_id"],
-                    "title": self.documents[case["document_id"]]["title"],
-                    "document_type": case["document_type"],
-                    "revision": case["revision"],
-                    "has_extraction": bool(case.get("extraction")),
-                    "period_start": fields.get("period_start"),
-                    "period_end": fields.get("period_end"),
-                }
-            )
-        return result
+        from agent.dev.comparison_context import list_comparison_sources
+
+        return list_comparison_sources(self)
 
     async def load_materials(self, case_id, selection):
         from agent.dev.comparison_materials import build_materials
+        from agent.dev.material_rebase import material_candidate, rebase_review, same_selection
 
-        case = self.cases[case_id]
+        case = self._record(case_id)
         if any(self.jobs[j]["status"] in ("queued", "running") for j in case["jobs"]):
             raise ComparisonInputError("실행 중인 작업을 마친 뒤 대조 자료를 변경해 주세요.")
         expected = {"contract_case_id", "attendance_case_ids", "payslip_case_id", "deposit_case_ids"}
@@ -413,11 +552,13 @@ class LocalStore:
         for key in ("contract_case_id", "payslip_case_id"):
             if selection.get(key) is not None and not isinstance(selection[key], str):
                 raise ComparisonInputError("대조할 문서를 선택해 주세요.")
+        previous = case.get("materials")
         draft = Confirmation(
             period_start=case["draft"].get("period_start", ""),
             period_end=case["draft"].get("period_end", ""),
         ).model_dump()
         materials = None
+        changes = []
         if any(selection.get(key) for key in expected):
             try:
                 materials = build_materials(self, selection)
@@ -425,21 +566,65 @@ class LocalStore:
                 raise ComparisonInputError(
                     str(exc) if isinstance(exc, ValueError) else "선택한 자료를 찾을 수 없습니다."
                 ) from exc
-            for key, value in materials["suggested"].items():
-                if key in draft and value is not None:
-                    draft[key] = value
-            draft["material_review"] = {
-                "earnings": {row["item_id"]: row["amount"] for row in materials["earnings"]},
-                "deductions": {row["item_id"]: row["amount"] for row in materials["deductions"]},
-                "transactions": {
-                    row["transaction_id"]: {
-                        "selected": False,
-                        "amount": row["amount"],
-                        "transaction_amount": row["transaction_amount"],
-                    }
-                    for row in materials["transactions"]
-                },
+            candidate = material_candidate(draft, materials)
+            if previous and same_selection(previous["selection"], materials["selection"]):
+                baseline = material_candidate(Confirmation().model_dump(), previous)
+                draft, changes = merge_extraction_draft(
+                    case["draft"], baseline, candidate, case.get("confirmed")
+                )
+                review, warnings = rebase_review(
+                    previous,
+                    materials,
+                    case["draft"].get("material_review", {}),
+                    candidate["material_review"],
+                    (case.get("confirmed") or {}).get("material_review"),
+                )
+                draft["material_review"] = review
+                materials["warnings"] = list(dict.fromkeys(materials["warnings"] + warnings))
+            else:
+                draft = candidate
+                if previous:
+                    review, warnings = rebase_review(
+                        previous,
+                        materials,
+                        {"manual_rows": case["draft"].get("material_review", {}).get("manual_rows", [])},
+                        candidate["material_review"],
+                    )
+                    draft["material_review"] = review
+                    materials["warnings"] = list(dict.fromkeys(materials["warnings"] + warnings))
+        if previous or case["draft"] != Confirmation().model_dump():
+            case.setdefault("draft_history", []).append(
+                {
+                    "revision": case["revision"],
+                    "saved_at": datetime.now(UTC).isoformat(),
+                    "reason": "before_material_refresh"
+                    if previous
+                    and materials
+                    and same_selection(previous["selection"], materials["selection"])
+                    else "before_material_selection_change",
+                    "draft": copy.deepcopy(case["draft"]),
+                    "materials": copy.deepcopy(previous),
+                }
+            )
+        selected_ids = set((materials or {}).get("source_versions", {}))
+        previous_identities = {
+            source["case_id"]: source.get("identity", {}) for source in (previous or {}).get("sources", [])
+        }
+        draft["source_identity"] = {}
+        for source_id, identity in case["draft"].get("source_identity", {}).items():
+            if source_id not in selected_ids:
+                continue
+            baseline = previous_identities.get(source_id, {})
+            # Older clients saved displayed defaults as overrides. Refresh those
+            # from the source; only a value different from the old source is an edit.
+            edited = {
+                key: value
+                for key, value in identity.items()
+                if value.strip() and value.strip() != (baseline.get(key) or "").strip()
             }
+            if edited:
+                draft["source_identity"][source_id] = edited
+        draft["subjects_confirmed"] = False
         case.update(
             materials=materials,
             materials_revision=case["revision"] + 1,
@@ -453,9 +638,10 @@ class LocalStore:
             stale=bool(case["analysis"]),
             explanation=None,
             report=None,
+            extraction_changes=changes,
         )
         self.save_case(case)
-        return copy.deepcopy(case)
+        return self._record_view(case)
 
     def _validate_material_review(self, case, confirmation, *, allocations=False):
         from decimal import Decimal, InvalidOperation
@@ -464,14 +650,14 @@ class LocalStore:
 
         materials = case.get("materials")
         review = confirmation.material_review.model_dump()
+        if set(confirmation.source_identity) - set((materials or {}).get("source_versions", {})):
+            raise ComparisonInputError(
+                "연결한 자료에 없는 근로자·사업장 정보입니다. 자료를 다시 확인해 주세요."
+            )
         if not materials:
             if any(review.values()):
                 raise ComparisonInputError("자료를 먼저 연결한 뒤 상세 항목을 확인해 주세요.")
             return
-        if confirmation.synthetic_auxiliary:
-            raise ComparisonInputError(
-                "실제 연결 자료와 가상 보조자료를 함께 사용할 수 없습니다. 가상 보조자료를 해제해 주세요."
-            )
         if not materials_current(self, materials):
             raise ComparisonInputError("연결한 문서가 변경되었습니다. 자료를 다시 불러온 뒤 확인해 주세요.")
         for group, key in (
@@ -482,11 +668,37 @@ class LocalStore:
             ids = {row[key] for row in materials[group]}
             if set(review[group]) - ids:
                 raise ComparisonInputError("연결 자료에 없는 상세 항목입니다. 자료를 다시 불러와 주세요.")
+        row_ids = {row["item_id"] for group in ("earnings", "deductions") for row in materials[group]}
+        if set(review["row_roles"]) - row_ids:
+            raise ComparisonInputError("연결 자료에 없는 항목 분류입니다. 자료를 다시 불러와 주세요.")
+        manual_rows = review["manual_rows"]
+        if len({row["row_id"] for row in manual_rows}) != len(manual_rows):
+            raise ComparisonInputError("수기로 보완한 항목 ID가 중복되었습니다.")
+        payslip = next(
+            (
+                source
+                for source in materials["sources"]
+                if source["case_id"] == materials["selection"].get("payslip_case_id")
+            ),
+            None,
+        )
+        if manual_rows and not payslip:
+            raise ComparisonInputError("누락 항목을 보완하려면 급여명세서를 먼저 연결해 주세요.")
+        if allocations and any(not row["label"] for row in manual_rows):
+            raise ComparisonInputError("수기로 보완한 항목의 원문 항목명을 입력해 주세요.")
+        if payslip and any(
+            row["page"] > self.documents[payslip["document_id"]]["pages"] for row in manual_rows
+        ):
+            raise ComparisonInputError("보완 항목의 원문 페이지가 명세서 범위를 벗어났습니다.")
         selected = {}
         for row in materials["transactions"]:
             item = review["transactions"].get(row["transaction_id"], {})
             if not item.get("selected"):
                 continue
+            if row_requires_replacement(row, "deposit_amount"):
+                raise ComparisonInputError(
+                    "거래일·거래 식별정보를 확인하지 못한 입금입니다. 해당 거래의 선택을 해제하고 원문을 확인해 주세요."
+                )
             try:
                 amount = Decimal(item.get("amount") or "")
                 original = Decimal(
@@ -516,8 +728,9 @@ class LocalStore:
             raise ComparisonInputError(
                 "날짜·금액이 같은 입금 중복 후보가 있습니다. 하나만 선택하거나 각각 별개 거래인지 확인해 주세요."
             )
-        used = {}
-        for other in self.cases.values():
+        used, period_allocations = {}, {}
+        target_period = (confirmation.period_start, confirmation.period_end)
+        for other in self._all_records():
             saved = other.get("confirmed_materials")
             if (
                 other["id"] == case["id"]
@@ -526,10 +739,22 @@ class LocalStore:
                 or not materials_current(self, saved)
             ):
                 continue
-            other_review = (other.get("confirmed") or {}).get("material_review", {}).get("transactions", {})
+            other_confirmation = other.get("confirmed") or {}
+            other_period = (other_confirmation.get("period_start"), other_confirmation.get("period_end"))
+            alternative = case.get("kind") == other.get("kind") == "comparison"
+            if alternative and other_period == target_period:
+                continue
+            other_review = other_confirmation.get("material_review", {}).get("transactions", {})
             for tid, item in other_review.items():
                 if item.get("selected") and item.get("amount") not in (None, ""):
-                    used[tid] = used.get(tid, Decimal(0)) + Decimal(item["amount"])
+                    value = Decimal(item["amount"])
+                    if alternative:
+                        key = (other_period, tid)
+                        period_allocations[key] = max(period_allocations.get(key, Decimal(0)), value)
+                    else:
+                        used[tid] = used.get(tid, Decimal(0)) + value
+        for (_, tid), value in period_allocations.items():
+            used[tid] = used.get(tid, Decimal(0)) + value
         for tid, (amount, original) in selected.items():
             if used.get(tid, Decimal(0)) + amount > original:
                 raise ComparisonInputError(
@@ -538,11 +763,7 @@ class LocalStore:
 
     def document_data(self, doc_id):
         doc = self.documents[doc_id]
-        data = (
-            (self.state / "uploads" / (doc_id + ".pdf"))
-            if doc["kind"] == "upload"
-            else self.corpus / doc["pdf"]
-        ).read_bytes()
+        data = (self.state / "uploads" / (doc_id + ".pdf")).read_bytes()
         if content_hash(data) != doc["sha256"]:
             raise ValueError("자료 해시가 달라졌습니다.")
         return data
@@ -561,24 +782,13 @@ class LocalStore:
         )
 
     async def list_documents(self):
-        evaluation = (
-            read_json(self.corpus / "evaluation.json") if (self.corpus / "evaluation.json").exists() else {}
-        )
-        scores = {r["document_id"]: r for r in evaluation.get("records", [])}
         return [
-            {
-                **{k: d[k] for k in ("id", "kind", "category", "title", "pages")},
-                "evaluation_status": scores.get(d["id"], {}).get("status", "pending"),
-            }
-            for d in self.documents.values()
+            {k: d[k] for k in ("id", "kind", "category", "title", "pages")} for d in self.documents.values()
         ]
 
-    async def create_case(self, doc_id, document_type="contract"):
-        validate_document_type(document_type)
-        if doc_id not in self.documents:
-            raise KeyError("자료를 찾을 수 없습니다.")
-        case = {
-            "id": identifier("case"),
+    def _new_record(self, record_id, doc_id, document_type):
+        return {
+            "id": record_id,
             "document_id": doc_id,
             "document_type": document_type,
             "document_type_revision": 1,
@@ -588,6 +798,13 @@ class LocalStore:
             "draft": Confirmation().model_dump(),
             "confirmed": None,
             "extraction": None,
+            "extraction_a": None,
+            "extraction_a_revision": 0,
+            "extraction_a_context": {},
+            "supplements": [],
+            "candidate_selections": {},
+            "candidate_selection_history": [],
+            "ocr": None,
             "extraction_revision": 0,
             "materials": None,
             "materials_revision": 0,
@@ -599,14 +816,55 @@ class LocalStore:
             "report": None,
             "jobs": [],
             "stale": False,
+            "extraction_changes": [],
+            "draft_history": [],
+            "extraction_engine_version": None,
+            "extraction_needs_review": False,
         }
-        if self.documents[doc_id]["kind"] == "upload":
-            case["upload"] = self.documents[doc_id]
+
+    async def create_case(self, doc_id, document_type="auto"):
+        validate_document_type(document_type)
+        if doc_id not in self.documents:
+            raise KeyError("자료를 찾을 수 없습니다.")
+        case = self._new_record(identifier("case"), doc_id, document_type)
         self.cases[case["id"]] = case
         self.save_case(case)
         return copy.deepcopy(case)
 
-    async def upload(self, data, document_type="contract", filename=None):
+    async def create_comparison(
+        self, title="새 비교 묶음", *, period_start="", period_end="", selection=None
+    ):
+        if not isinstance(title, str) or len(title.strip()) > 120:
+            raise ComparisonInputError("비교 묶음 이름은 120자 이내로 입력해 주세요.")
+        confirmation = Confirmation(period_start=period_start, period_end=period_end)
+        confirmation.validate_for_analysis()
+        case = self._new_record(identifier("comparison"), None, "comparison")
+        case.update(
+            kind="comparison",
+            title=title.strip() or "새 비교 묶음",
+            draft=confirmation.model_dump(),
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        self.comparisons[case["id"]] = case
+        try:
+            if selection is not None:
+                return await self.load_materials(case["id"], selection)
+            result = self._record_view(case)
+            self.save_case(case)
+            return result
+        except Exception:
+            self.comparisons.pop(case["id"], None)
+            # Only this newly generated independent record can have been written.
+            (self.state / "comparisons" / (case["id"] + ".json")).unlink(missing_ok=True)
+            raise
+
+    async def list_comparisons(self):
+        return [self._record_view(self._refresh_materials(case)) for case in self.comparisons.values()]
+
+    async def get_comparison(self, comparison_id):
+        return self._record_view(self._refresh_materials(self.comparisons[comparison_id]))
+
+    async def upload(self, data, document_type="auto", filename=None):
         validate_document_type(document_type)
         if not data.startswith(b"%PDF-") or len(data) > self.settings.max_file_bytes:
             raise ValueError("20MB 이하 PDF만 업로드할 수 있습니다.")
@@ -626,6 +884,7 @@ class LocalStore:
             "pages": len(reader.pages),
             "sha256": content_hash(data),
         }
+        write_json(self.state / "documents.json", self.documents)
         return await self.create_case(doc_id, document_type)
 
     async def change_document_type(self, case_id, document_type):
@@ -635,6 +894,7 @@ class LocalStore:
             raise ValueError("실행 중인 작업을 마친 뒤 문서 유형을 변경해 주세요.")
         if case["document_type"] == document_type:
             return copy.deepcopy(case)
+        clear_candidates(case, "document_type_changed")
         case.update(
             document_type=document_type,
             document_type_revision=case["revision"] + 1,
@@ -650,6 +910,10 @@ class LocalStore:
             materials=None,
             confirmed_materials=None,
             materials_invalid=False,
+            extraction_changes=[],
+            extraction_draft=None,
+            extraction_engine_version=None,
+            extraction_needs_review=False,
         )
         self.save_case(case)
         self._invalidate_material_dependents(case_id)
@@ -658,12 +922,53 @@ class LocalStore:
     async def get_case(self, case_id):
         return copy.deepcopy(self._refresh_materials(self.cases[case_id]))
 
+    async def select_candidate(self, case_id, request):
+        case = self.cases[case_id]
+        if any(self.jobs[j]["status"] in ("queued", "running") for j in case["jobs"]):
+            raise ComparisonInputError("실행 중인 작업을 마친 뒤 후보를 선택해 주세요.")
+        self._validate_ocr(case)
+        ref = self.document_ref(case["document_id"])
+        try:
+            payload, record = select_candidate(
+                case, request, document_hash=ref.content_hash, source_id=ref.source_id
+            )
+        except ValueError as exc:
+            raise ComparisonInputError(str(exc)) from exc
+        previous = extraction_draft(case["extraction"])
+        candidate = extraction_draft(payload)
+        draft, changes = merge_extraction_draft(case["draft"], previous, candidate, case.get("confirmed"))
+        case.setdefault("draft_history", []).append(
+            {
+                "revision": case["revision"],
+                "saved_at": datetime.now(UTC).isoformat(),
+                "reason": "before_candidate_selection",
+                "draft": copy.deepcopy(case["draft"]),
+            }
+        )
+        case["candidate_selections"][record["field_id"]] = copy.deepcopy(record)
+        case["candidate_selection_history"].append(record)
+        case.update(
+            extraction=payload.model_dump(mode="json"),
+            extraction_revision=case["extraction_revision"] + 1,
+            extraction_draft=candidate,
+            draft=draft,
+            extraction_changes=changes,
+            revision=case["revision"] + 1,
+            dirty=True,
+            confirmed=None,
+            confirmed_revision=None,
+            stale=bool(case["analysis"]),
+            explanation=None,
+            report=None,
+        )
+        self.save_case(case)
+        self._invalidate_material_dependents(case_id)
+        return self._record_view(case)
+
     async def save_draft(self, case_id, draft):
         confirmation = Confirmation.model_validate(draft)
-        case = self.cases[case_id]
+        case = self._record(case_id)
         self._validate_material_review(case, confirmation)
-        if confirmation.synthetic_auxiliary and self.documents[case["document_id"]]["kind"] != "synthetic":
-            raise ValueError("가상 보조자료는 가상 작성본에만 연결할 수 있습니다.")
         case.update(
             draft=confirmation.model_dump(),
             revision=case["revision"] + 1,
@@ -671,11 +976,19 @@ class LocalStore:
             stale=bool(case["analysis"]),
         )
         self.save_case(case)
-        return copy.deepcopy(case)
+        return self._record_view(case)
 
     async def confirm(self, case_id):
-        case = self.cases[case_id]
+        case = self._record(case_id)
         self._refresh_materials(case)
+        if not case.get("extraction") and not case.get("materials"):
+            raise ComparisonInputError("AI 처리 페이지에서 항목을 처리하거나 AI 처리된 자료를 연결해 주세요.")
+        if case.get("extraction_needs_review") and (
+            not case.get("materials") or case_id in case["materials"]["source_versions"]
+        ):
+            raise ComparisonInputError(
+                "추출 검증 기준이 변경되었습니다. 수정값은 보존되니 문서를 다시 추출해 주세요."
+            )
         if case.get("materials_invalid"):
             raise ComparisonInputError("연결한 문서가 변경되었습니다. 대조 자료를 다시 불러와 주세요.")
         confirmation = Confirmation.model_validate(case["draft"])
@@ -683,6 +996,7 @@ class LocalStore:
         if not confirmation.period_start or not confirmation.period_end:
             raise ValueError("대조할 급여 기간의 시작일과 종료일을 입력해 주세요.")
         self._validate_material_review(case, confirmation, allocations=True)
+        self._validate_comparison_context(case, confirmation)
         case.update(
             confirmed=confirmation.model_dump(),
             confirmed_revision=case["revision"],
@@ -690,7 +1004,7 @@ class LocalStore:
             dirty=False,
         )
         self.save_case(case)
-        return copy.deepcopy(case)
+        return self._record_view(case)
 
     def public_job(self, job):
         return {k: copy.deepcopy(v) for k, v in job.items() if k not in ("task", "manual_sources")}
@@ -698,14 +1012,52 @@ class LocalStore:
     async def get_job(self, job_id):
         return self.public_job(self.jobs[job_id])
 
-    async def create_job(self, case_id, stage, *, use_saved=True, include_original=False):
-        if stage not in ("extract", "analyze", "explain", "report"):
+    def _ocr_fingerprint(self):
+        return digest(
+            [
+                self.settings.ocr_command,
+                str(self.settings.ocr_data_path),
+                self.settings.ocr_dpi,
+                self.settings.ocr_page_timeout,
+            ]
+        )
+
+    async def create_job(
+        self, case_id, stage, *, include_original=False, field_ids=None, extraction_revision=None
+    ):
+        if stage not in ("ocr", "extract", "supplement", "analyze", "explain", "report"):
             raise ValueError("알 수 없는 작업입니다.")
-        case = self.cases[case_id]
+        if stage != "supplement" and (field_ids is not None or extraction_revision is not None):
+            raise ComparisonInputError("보완 항목은 원문 보완 작업에서만 지정할 수 있습니다.")
+        case = self._record(case_id)
+        if case.get("kind") == "comparison" and stage in ("ocr", "extract", "supplement"):
+            raise ComparisonInputError(
+                "비교 묶음에서는 OCR·AI 추출을 실행할 수 없습니다. 개별 문서에서 실행해 주세요."
+            )
+        if (
+            stage not in ("ocr", "extract", "supplement")
+            and case.get("extraction_needs_review")
+            and (not case.get("materials") or case_id in case["materials"]["source_versions"])
+        ):
+            raise ComparisonInputError("새 검증 기준으로 문서를 다시 추출한 뒤 확인해 주세요.")
         self._refresh_materials(case)
         if any(self.jobs[j]["status"] in ("queued", "running") for j in case["jobs"]):
             raise ValueError("현재 작업이 끝난 뒤 실행해 주세요.")
-        if stage != "extract" and (case["dirty"] or case["confirmed_revision"] is None):
+        if stage == "ocr":
+            return self._create_ocr_job(case)
+        targets = []
+        if stage in ("extract", "supplement"):
+            self._validate_ocr(case)
+        if stage == "supplement":
+            try:
+                targets = supplement_targets(case, field_ids, extraction_revision)
+                if case["extraction_a_context"].get("ocr_result_id") != case["ocr"]["id"]:
+                    raise ValueError("저장 OCR이 변경되었습니다. 기본 항목 정리를 다시 실행해 주세요.")
+            except ValueError as exc:
+                raise ComparisonInputError(str(exc)) from exc
+        if stage not in ("ocr", "extract", "supplement") and (
+            case["dirty"] or case["confirmed_revision"] is None
+        ):
             raise ValueError("수정한 값을 먼저 확인해 주세요.")
         if stage in ("explain", "report") and (not case["analysis"] or case["stale"]):
             raise ValueError("최신 입력으로 대조를 실행해 주세요.")
@@ -714,6 +1066,7 @@ class LocalStore:
         jid = identifier("job")
         kind = {
             "extract": "extract_document",
+            "supplement": "extract_document",
             "analyze": "analyze_case",
             "explain": "explain_result",
             "report": "build_report",
@@ -728,14 +1081,22 @@ class LocalStore:
             idempotency_key=jid,
             requested_at=datetime.now(UTC),
         )
-        ref, manual_sources = self.document_ref(case["document_id"]), []
-        if stage == "extract":
+        ref = self.document_ref(case["document_id"]) if case.get("document_id") else None
+        manual_sources = []
+        if stage in ("extract", "supplement"):
             payload = ExtractionInput(
                 source=ref,
                 document_type=case["document_type"],
                 model_config_version=self.settings.model_config_version,
+                ocr_result_id=case["ocr"]["id"],
+                **(
+                    {"extraction_method": "pdf_supplement", "target_fields": targets}
+                    if stage == "supplement"
+                    else {}
+                ),
             )
         elif stage == "analyze":
+            self._validate_comparison_context(case, Confirmation.model_validate(case["confirmed"]))
             snapshot, manual_ref, manual_data = make_snapshot(
                 case, ref, Confirmation.model_validate(case["confirmed"])
             )
@@ -773,7 +1134,7 @@ class LocalStore:
                 )
                 if include_original and case.get("confirmed_materials")
                 else [ref]
-                if include_original
+                if include_original and ref is not None
                 else [],
                 generated_at=datetime.now(UTC),
             )
@@ -789,20 +1150,25 @@ class LocalStore:
             "events": [],
             "error": None,
             "usage": {},
-            "use_saved": bool(use_saved),
             "task": task.model_dump(mode="json"),
             "manual_sources": manual_sources,
             "provider_mode": self.settings.provider_mode,
             "origin": self.origin,
             "model_config_version": self.settings.model_config_version,
             "model": self.settings.extraction_model
-            if stage == "extract"
+            if stage in ("extract", "supplement")
             else "Python 규칙"
             if stage == "analyze"
             else self.settings.explanation_model,
             "material_versions": copy.deepcopy((case.get("materials") or {}).get("source_versions", {})),
             "created_at": datetime.now(UTC).isoformat(),
         }
+        if stage == "supplement":
+            job.update(
+                base_extraction_revision=case["extraction_a_revision"],
+                ocr_result_id=case["ocr"]["id"],
+                document_hash=ref.content_hash,
+            )
         self.jobs[jid] = job
         case["jobs"].append(jid)
         self.save_case(case)
@@ -810,15 +1176,146 @@ class LocalStore:
         self.tasks[jid] = asyncio.create_task(self._execute(job, task))
         return self.public_job(job)
 
+    def _validate_ocr(self, case):
+        result = case.get("ocr")
+        ref = self.document_ref(case["document_id"])
+        if not result:
+            raise ComparisonInputError("OCR 추출 페이지에서 문자를 먼저 추출해 주세요.")
+        if (
+            result.get("document_id") != ref.document_id
+            or result.get("document_version") != ref.document_version
+            or result.get("content_hash") != ref.content_hash
+        ):
+            raise ComparisonInputError("문서가 변경되었습니다. OCR 추출을 다시 실행해 주세요.")
+        self.document_data(case["document_id"])
+
+    def _create_ocr_job(self, case):
+        jid = identifier("job")
+        job = {
+            "id": jid,
+            "case_id": case["id"],
+            "stage": "ocr",
+            "document_type": case["document_type"],
+            "status": "queued",
+            "revision": case["revision"],
+            "events": [],
+            "error": None,
+            "usage": {},
+            "call_budget": {},
+            "manual_sources": [],
+            "task": None,
+            "provider_mode": "local_ocr",
+            "origin": self.origin,
+            "model": "Python OCR",
+            "model_config_version": None,
+            "ocr_fingerprint": self._ocr_fingerprint(),
+            "source": self.document_ref(case["document_id"]).model_dump(mode="json"),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        self.jobs[jid] = job
+        case["jobs"].append(jid)
+        self.save_case(case)
+        self.save_job(job)
+        self.tasks[jid] = asyncio.create_task(self._execute_ocr(job))
+        return self.public_job(job)
+
+    async def _execute_ocr(self, job):
+        from agent.services.document_ocr import recognize_document
+
+        case = self.cases[job["case_id"]]
+        token = secrets.token_urlsafe(32)
+        self.current_tokens[job["id"]] = token
+
+        async def control():
+            if self.current_tokens.get(job["id"]) != token or job["status"] == "cancelled":
+                raise JobCancelled("OCR 작업이 취소되었습니다.")
+            if case["revision"] != job["revision"]:
+                raise IntegrityError("입력이 바뀌었습니다. OCR 추출을 새로 실행해 주세요.")
+
+        try:
+            async with self.semaphore:
+                await control()
+                job.update(status="running", error=None)
+                job["events"].append({"node_id": "recognize_document", "status": "running"})
+                self.save_job(job)
+                ref = self.document_ref(case["document_id"])
+                if ref.model_dump(mode="json") != job["source"]:
+                    raise IntegrityError("OCR 작업과 문서 버전이 다릅니다.")
+                data = self.document_data(case["document_id"])
+                recognized = await recognize_document(data, self.settings, control=control)
+                await control()
+                clear_candidates(case, "ocr_replaced")
+                case.update(
+                    ocr={
+                        **recognized,
+                        "id": job["id"],
+                        "document_id": ref.document_id,
+                        "document_version": ref.document_version,
+                        "content_hash": ref.content_hash,
+                        "created_at": datetime.now(UTC).isoformat(),
+                    },
+                    extraction=None,
+                    confirmed=None,
+                    confirmed_revision=None,
+                    extraction_revision=case.get("extraction_revision", 0) + 1,
+                    extraction_needs_review=False,
+                    extraction_engine_version=None,
+                    revision=case["revision"] + 1,
+                    dirty=True,
+                    stale=bool(case["analysis"]),
+                    explanation=None,
+                    report=None,
+                )
+                self.save_case(case)
+                self._invalidate_material_dependents(case["id"])
+                job["events"].append({"node_id": "recognize_document", "status": "completed"})
+                job.update(status="completed", error=None)
+        except asyncio.CancelledError, JobCancelled:
+            job.update(status="cancelled", error="OCR 추출을 취소했습니다. 다시 실행할 수 있습니다.")
+        except AgentError as exc:
+            job.update(status="failed", error=str(exc), error_code=exc.code)
+        except Exception:
+            job.update(
+                status="failed",
+                error="OCR 자료를 처리하지 못했습니다. 문서와 OCR 설정을 확인해 주세요.",
+                error_code="LOCAL_OCR_ERROR",
+            )
+        finally:
+            self.save_job(job)
+
     async def resume_job(self, job_id):
         job = self.jobs[job_id]
-        self._refresh_materials(self.cases[job["case_id"]])
-        if any(self.jobs[j]["status"] in ("queued", "running") for j in self.cases[job["case_id"]]["jobs"]):
+        case = self._record(job["case_id"])
+        self._refresh_materials(case)
+        if case.get("kind") == "comparison" and job["stage"] in ("ocr", "extract", "supplement"):
+            raise ComparisonInputError("비교 묶음에서는 원본 문서의 OCR·AI 추출을 실행할 수 없습니다.")
+        if any(self.jobs[j]["status"] in ("queued", "running") for j in case["jobs"]):
             raise ValueError("현재 작업이 끝난 뒤 이어서 실행해 주세요.")
         if job["status"] not in ("interrupted", "cancelled", "failed"):
             raise ValueError("중단 또는 실패한 작업만 이어서 실행할 수 있습니다.")
-        if self.cases[job["case_id"]]["revision"] != job["revision"]:
+        if case["revision"] != job["revision"]:
             raise ValueError("입력이 바뀌었습니다. 새 작업을 실행해 주세요.")
+        if job["stage"] == "supplement":
+            self._validate_ocr(case)
+            try:
+                validate_supplement_lineage(case, job)
+                supplement_targets(
+                    case,
+                    [item["field_id"] for item in job["task"]["payload"]["target_fields"]],
+                    case["extraction_revision"],
+                )
+            except ValueError as exc:
+                raise ComparisonInputError(str(exc)) from exc
+        if job["stage"] == "analyze":
+            self._validate_comparison_context(case, Confirmation.model_validate(case["confirmed"]))
+        if job["stage"] == "ocr":
+            if job.get("ocr_fingerprint") != self._ocr_fingerprint():
+                raise ValueError("OCR 설정이 바뀌었습니다. 새 작업을 실행해 주세요.")
+            job.update(status="queued", error=None)
+            job.pop("error_code", None)
+            self.save_job(job)
+            self.tasks[job_id] = asyncio.create_task(self._execute_ocr(job))
+            return self.public_job(job)
         if (
             job["provider_mode"] != self.settings.provider_mode
             or job["model_config_version"] != self.settings.model_config_version
@@ -827,6 +1324,7 @@ class LocalStore:
         task = AgentTask.model_validate(job["task"])
         task.context.execution_token = secrets.token_urlsafe(32)
         task.context.run_id = identifier("run")
+        job["task"]["context"]["run_id"] = task.context.run_id
         job.update(status="queued", error=None)
         job.pop("error_code", None)
         self.save_job(job)
@@ -842,8 +1340,10 @@ class LocalStore:
         self.tasks[job_id].cancel()
         job.update(
             status="cancelled",
-            usage_may_be_incomplete=True,
-            error="사용자가 작업을 취소했습니다. 이미 시작한 호출의 사용량은 발생할 수 있습니다.",
+            usage_may_be_incomplete=job["stage"] != "ocr",
+            error="OCR 추출을 취소했습니다."
+            if job["stage"] == "ocr"
+            else "사용자가 작업을 취소했습니다. 이미 시작한 호출의 사용량은 발생할 수 있습니다.",
         )
         self.save_job(job)
         await asyncio.gather(self.tasks[job_id], return_exceptions=True)
@@ -853,10 +1353,11 @@ class LocalStore:
         ports = LocalPorts(self, job)
         self.ports[job["id"]] = ports
         ports.bind(task.context)
-        case = self.cases[job["case_id"]]
+        case = self._record(job["case_id"])
         try:
-            ref = self.document_ref(case["document_id"])
-            ports.add_source(ref, self.document_data(case["document_id"]))
+            ref = self.document_ref(case["document_id"]) if case.get("document_id") else None
+            if ref is not None:
+                ports.add_source(ref, self.document_data(case["document_id"]))
             source_refs = (
                 task.payload.snapshot.authorized_sources
                 if job["stage"] == "analyze"
@@ -865,42 +1366,17 @@ class LocalStore:
                 else []
             )
             for linked_ref in source_refs:
-                if linked_ref.kind == "document" and linked_ref.source_id != ref.source_id:
+                if linked_ref.kind == "document" and (ref is None or linked_ref.source_id != ref.source_id):
                     ports.add_source(linked_ref, self.document_data(linked_ref.document_id))
             for manual in job["manual_sources"]:
                 ports.add_source(SourceRef.model_validate(manual["ref"]), manual["data"].encode())
             async with self.semaphore:
                 job["status"] = "running"
                 self.save_job(job)
-                cached = self.corpus / "results" / (case["document_id"] + ".json")
-                outcome = None
-                if (
-                    job["stage"] == "extract"
-                    and case["document_type"] == "contract"
-                    and job["use_saved"]
-                    and cached.exists()
-                ):
-                    from agent.schemas.public.tasks import AgentOutcome
-
-                    saved = AgentOutcome.model_validate(read_json(cached))
-                    proof_path = self.corpus / "usage" / (case["document_id"] + ".inputs.json")
-                    proof = read_json(proof_path) if proof_path.exists() else {}
-                    if proof.get("pdf_hash") == ref.content_hash and (
-                        saved.status != "completed" or saved.payload.document_type == case["document_type"]
-                    ):
-                        outcome = saved
-                        job["cache_source"] = (
-                            "실제 평가의 저장 결과 (추가 호출 없음)"
-                            if saved.status == "completed"
-                            else "실제 평가의 저장된 실패 결과 (추가 호출 없음)"
-                        )
-                if outcome is None:
-                    outcome = await run_task(
-                        task, ports=ports, settings=self.settings, provider=self.provider
-                    )
+                outcome = await run_task(task, ports=ports, settings=self.settings, provider=self.provider)
                 if self.current_tokens.get(job["id"]) != task.context.execution_token.get_secret_value():
                     return
-                if job["stage"] != "extract":
+                if job["stage"] not in ("extract", "supplement"):
                     self._refresh_materials(case)
                 if case["revision"] != job["revision"]:
                     job.update(
@@ -913,7 +1389,7 @@ class LocalStore:
                 else:
                     self._apply(case, job, outcome.payload)
                     job["status"] = "completed"
-                job["usage"] = {} if job.get("cache_source") else outcome.usage
+                job["usage"] = outcome.usage
                 self.save_case(case)
                 self.save_job(job)
         except asyncio.CancelledError:
@@ -940,15 +1416,13 @@ class LocalStore:
                 self.save_job(job)
                 if self.settings.provider_mode == "openai" and job.get("origin") == "local_console":
                     write_json(
-                        self.corpus / "usage" / ("interactive-" + job["id"] + ".json"),
+                        self.state / "usage" / ("interactive-" + job["id"] + ".json"),
                         {
                             "usage": job["usage"],
                             "job_id": job["id"],
                             "status": job["status"],
                             "call_budget": job["call_budget"],
-                            "model_calls": 0
-                            if job.get("cache_source")
-                            else sum(
+                            "model_calls": sum(
                                 v for k, v in job["call_budget"].items() if not k.endswith(":format_failures")
                             ),
                             "usage_may_be_incomplete": bool(job.get("usage_may_be_incomplete"))
@@ -958,39 +1432,71 @@ class LocalStore:
 
     def _apply(self, case, job, payload):
         stage = job["stage"]
-        if stage == "extract":
-            if payload.document_type != case["document_type"]:
+        if stage == "supplement":
+            entry = supplement_entry(case, job, payload)
+            case["supplements"] = [item for item in case["supplements"] if item["id"] != entry["id"]] + [
+                entry
+            ]
+        elif stage == "extract":
+            if case["document_type"] == "auto":
+                if payload.document_type not in ("contract", "attendance", "payslip", "deposit"):
+                    raise ValueError(
+                        "문서 유형을 분류하지 못했습니다. 문서를 종류별로 나누거나 유형을 직접 선택해 주세요."
+                    )
+                case["document_type"] = payload.document_type
+                # Automatic classification resolves this extraction; it is not a manual type reset.
+                case["document_type_revision"] = job.get("revision", case["revision"])
+                job["resolved_document_type"] = payload.document_type
+            elif payload.document_type != case["document_type"]:
                 raise ValueError("추출 결과와 선택한 문서 유형이 다릅니다.")
+            previous = case.get("extraction")
+            candidate = extraction_draft(payload)
+            baseline = case.get("extraction_draft") or (
+                extraction_draft(previous) if previous else Confirmation().model_dump()
+            )
+            if previous or case["draft"] != Confirmation().model_dump():
+                case.setdefault("draft_history", []).append(
+                    {
+                        "revision": case["revision"],
+                        "saved_at": datetime.now(UTC).isoformat(),
+                        "reason": "before_reextraction",
+                        "draft": copy.deepcopy(case["draft"]),
+                    }
+                )
+            if case.get("materials"):
+                # Connected data retains its own source versions; it is refreshed explicitly below.
+                draft, changes = copy.deepcopy(case["draft"]), []
+                for key in ("earnings_complete", "deductions_complete", "payment_scope_confirmed"):
+                    draft[key] = False
+            else:
+                draft, changes = merge_extraction_draft(
+                    case["draft"], baseline, candidate, case.get("confirmed")
+                )
+            clear_candidates(case, "base_extraction_replaced")
             case["extraction"] = payload.model_dump(mode="json")
             case["extraction_revision"] = case.get("extraction_revision", 0) + 1
-            case.update(materials=None, confirmed_materials=None, materials_invalid=False)
-            draft = Confirmation().model_dump()
-            draft["values"] = {f.field_id: f.normalized_value for f in payload.fields if f.field_id in FIELDS}
-            if case["document_type"] != "contract":
-                draft["manual"] = {
-                    f.field_id: f.normalized_value
-                    for f in payload.fields
-                    if f.field_id in MANUAL_FIELDS and f.normalized_value is not None
-                }
-                # Only use an explicitly printed total; never substitute a transaction balance or sum.
-                deposit_total = next((f for f in payload.fields if f.field_id == "deposit_total"), None)
-                if (
-                    case["document_type"] == "deposit"
-                    and deposit_total
-                    and deposit_total.normalized_value is not None
-                ):
-                    draft["manual"]["deposit"] = deposit_total.normalized_value
-                for key in ("period_start", "period_end"):
-                    value = next((f.normalized_value for f in payload.fields if f.field_id == key), None)
-                    if value:
-                        draft[key] = value
-                slip = next((f for f in payload.fields if f.field_id == "slip_rate"), None)
-                if slip and slip.unit in ("KRW/hour", "KRW/month", "KRW/year", "KRW/day"):
-                    draft["slip_unit"] = slip.unit
-            rate = next((f for f in payload.fields if f.field_id == "contract_rate"), None)
-            if rate and rate.unit in ("KRW/hour", "KRW/month", "KRW/year", "KRW/day"):
-                draft["contract_unit"] = rate.unit
-            case.update(draft=draft, revision=case["revision"] + 1, dirty=True, stale=bool(case["analysis"]))
+            case.update(
+                extraction_a=copy.deepcopy(case["extraction"]),
+                extraction_a_revision=case["extraction_revision"],
+                extraction_a_context={
+                    "ocr_result_id": (case.get("ocr") or {}).get("id"),
+                    "document_hash": self.documents[case["document_id"]]["sha256"],
+                    "job_id": job.get("id"),
+                    "run_id": ((job.get("task") or {}).get("context") or {}).get("run_id"),
+                },
+            )
+            case.update(
+                draft=draft,
+                extraction_draft=candidate,
+                extraction_engine_version=ENGINE_VERSION,
+                extraction_needs_review=False,
+                extraction_changes=changes,
+                revision=case["revision"] + 1,
+                dirty=True,
+                stale=bool(case["analysis"]),
+                explanation=None,
+                report=None,
+            )
             self._invalidate_material_dependents(case["id"])
         elif stage == "analyze":
             history = case.setdefault("analysis_history", [])
@@ -1039,13 +1545,14 @@ class LocalStore:
                 )
 
     async def artifact(self, artifact_id):
-        for case in self.cases.values():
+        for case in self._all_records():
+            self._refresh_materials(case)
             if case["report"] and not case["stale"] and not case["dirty"]:
                 for value in case["report"]["artifacts"]:
                     if value["artifact_id"] == artifact_id:
                         from agent.schemas.public.results import ArtifactRef
 
                         ref = ArtifactRef.model_validate(value)
-                        ports = FakePorts(directory=self.state / "artifacts-and-checkpoints")
+                        ports = LocalFilePorts(directory=self.state / "artifacts-and-checkpoints")
                         return ports.artifact_bytes(ref), ref.mime_type
         raise KeyError("최신 산출물을 찾을 수 없습니다.")

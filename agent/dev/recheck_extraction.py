@@ -1,4 +1,4 @@
-"""Run one real extraction call, or revalidate a retained response without extra calls.
+"""Run AI processing on saved OCR, or revalidate a retained response without extra calls.
 
 Stop the local server first: LocalStore supports one process at a time.
 """
@@ -28,7 +28,7 @@ async def main(args):
     if args.job_id:
         job = await store.resume_job(args.job_id)
     else:
-        job = await store.create_job(args.case_id, "extract", use_saved=False)
+        job = await store.create_job(args.case_id, "extract")
     print(json.dumps({"job_id": job["id"], "status": job["status"]}), flush=True)
     await store.tasks[job["id"]]
     job = await store.get_job(job["id"])

@@ -4,11 +4,12 @@ import pytest
 from pydantic import ValidationError
 
 from agent import run_task
-from agent.dev.fixtures import confirmed_result, explanation_task
-from agent.providers.fixture_provider import FixtureProvider
+from agent.rules.comparisons import payments, statements, terms
 from agent.schemas.public.inputs import ConditionState, Period
 from agent.services.hashing import digest
-from agent.tests.test_analysis import rehash
+from agent.tests.fixture_provider import FixtureProvider
+from agent.tests.fixtures_support import confirmed_result, explanation_task
+from agent.tests.test_analysis import detailed_context, rehash, work_record
 
 
 async def test_contract_can_cover_multiple_payroll_periods(setup_agent):
@@ -126,3 +127,111 @@ async def test_checkpoint_version_mismatch_never_reuses_state(setup_agent):
     ports.checkpoints[task.context.job_id].checkpoint_schema_version = "different"
     out = await run_task(task, ports=ports, settings=settings)
     assert out.status == "failed"
+
+
+def attach_period_source(snapshot, start, end, suffix="period"):
+    source = snapshot.authorized_sources[0].model_copy(
+        update={"source_id": suffix, "applicable_period": Period(start=start, end=end)}
+    )
+    evidence = snapshot.evidence_catalog[0].model_copy(
+        update={"evidence_id": suffix + "-evidence", "source_id": source.source_id}
+    )
+    snapshot.authorized_sources.append(source)
+    snapshot.evidence_catalog.append(evidence)
+    return evidence.evidence_id
+
+
+async def test_source_period_cannot_be_relabelled_as_current_payroll_period(setup_agent):
+    task, ports, settings = setup_agent
+    snapshot = task.payload.snapshot
+    ref = attach_period_source(snapshot, "2026-09-01", "2026-09-30")
+    next(field for field in snapshot.confirmed_fields if field.field_id == "contract_rate").evidence_refs = [
+        ref
+    ]
+    ports.add_source(snapshot.authorized_sources[-1], ports.sources["source-demo"])
+    rehash(task)
+    out = await run_task(task, ports=ports, settings=settings)
+    assert out.status == "completed", out.error
+    result = out.payload.comparisons[0]
+    assert result.status == "needs_review"
+    assert result.reason_codes == ["SOURCE_PERIOD_MISMATCH"]
+    assert result.delta is None
+    assert all(item.status == "match" for item in out.payload.comparisons[1:6])
+
+
+@pytest.mark.parametrize("target", ["earnings", "deductions", "transaction_allocations"])
+def test_source_link_period_is_checked_for_statement_and_payment_details(setup_agent, target):
+    task, _, _ = setup_agent
+    snapshot = task.payload.snapshot
+    ref = attach_period_source(snapshot, "2026-09-01", "2026-09-30")
+    getattr(snapshot, target)[0].evidence_refs.append(ref)
+    rehash(task)
+    from agent.services.calculation_context import build_calculation_context
+
+    ctx = build_calculation_context(snapshot, snapshot.owner_id, snapshot.case_id)
+    results = statements(ctx) + payments(ctx)
+    index = {"earnings": 0, "deductions": 1, "transaction_allocations": 3}[target]
+    assert results[index].status == "needs_review"
+    assert results[index].reason_codes == ["SOURCE_PERIOD_MISMATCH"]
+    assert results[index].delta is None
+    assert all(item.status == "match" for i, item in enumerate(results) if i != index)
+
+
+@pytest.mark.parametrize(
+    "periods,expected",
+    [
+        ([("2026-01-01", "2026-12-31")], "match"),
+        ([("2026-10-01", "2026-10-15"), ("2026-10-16", "2026-10-31")], "match"),
+        ([("2026-10-01", "2026-10-15"), ("2026-10-17", "2026-10-31")], "needs_review"),
+        ([("2026-10-01", "2026-10-15")], "needs_review"),
+        ([("2026-10-01", "2026-10-31"), ("2026-09-01", "2026-09-30")], "needs_review"),
+    ],
+)
+def test_multiple_declared_source_periods_need_complete_coverage_even_with_manual_evidence(
+    setup_agent, periods, expected
+):
+    task, _, _ = setup_agent
+    snapshot = task.payload.snapshot
+    field = next(field for field in snapshot.confirmed_fields if field.field_id == "worked_minutes")
+    for index, (start, end) in enumerate(periods):
+        field.evidence_refs.append(attach_period_source(snapshot, start, end, suffix=f"period-{index}"))
+    rehash(task)
+    from agent.services.calculation_context import build_calculation_context
+
+    ctx = build_calculation_context(snapshot, snapshot.owner_id, snapshot.case_id)
+    result = terms(ctx)[1]
+    assert result.status == expected
+    assert ("SOURCE_PERIOD_MISMATCH" in result.reason_codes) == (expected == "needs_review")
+
+
+def test_contract_source_can_apply_to_current_payroll_with_longer_contract_field_period(setup_agent):
+    task, _, _ = setup_agent
+    snapshot = task.payload.snapshot
+    ref = attach_period_source(snapshot, "2026-10-01", "2026-10-31")
+    field = next(field for field in snapshot.confirmed_fields if field.field_id == "contract_rate")
+    field.period = Period(start="2026-01-01", end="2026-12-31")
+    field.evidence_refs.append(ref)
+    ctx = detailed_context(task, [])
+    assert terms(ctx)[0].status == "match"
+
+
+def test_payroll_detail_source_period_mismatch_holds_time_comparison(setup_agent):
+    task, _, _ = setup_agent
+    snapshot = task.payload.snapshot
+    ref = attach_period_source(snapshot, "2026-09-01", "2026-09-30")
+    ctx = detailed_context(
+        task,
+        [
+            work_record(
+                "wrong-period",
+                "2026-10-01T09:00:00+09:00",
+                "2026-10-01T10:00:00+09:00",
+                evidence_refs=[ref],
+            )
+        ],
+    )
+    result = terms(ctx)[1]
+    assert result.status == "needs_review"
+    assert result.reason_codes == ["SOURCE_PERIOD_MISMATCH"]
+    assert result.delta is None
+    assert terms(ctx)[0].status == "match"

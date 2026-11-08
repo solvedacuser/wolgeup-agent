@@ -29,7 +29,10 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--basetemp=.pytest-tmp"
-markers = ["private_corpus: requires the original validation documents and cached evaluation results"]
+markers = [
+  "private_corpus: requires the original validation documents and cached evaluation results",
+  "real_ocr: uses the installed local OCR engine instead of the deterministic test adapter",
+]
 
 [tool.ruff]
 target-version = "py314"

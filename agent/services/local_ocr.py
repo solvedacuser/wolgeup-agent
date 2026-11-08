@@ -89,11 +89,21 @@ def tsv_lines(tsv):
 
 def recognize_pdf(data, settings, page_numbers=None):
     with OCR_LOCK:
-        return _recognize_pdf(data, settings, page_numbers)
+        try:
+            return _recognize_pdf(data, settings, page_numbers)
+        except OCRFailed, OCRUnavailable:
+            raise
+        except Exception as exc:
+            raise OCRFailed(
+                "PDF 이미지를 OCR로 처리하지 못했습니다. 문서 파일과 페이지 상태를 확인해 주세요."
+            ) from exc
 
 
 def _recognize_pdf(data, settings, page_numbers):
-    import pypdfium2 as pdfium
+    try:
+        import pypdfium2 as pdfium
+    except ImportError as exc:
+        raise OCRUnavailable("PDF를 OCR 이미지로 변환하는 pypdfium2 설치가 필요합니다.") from exc
 
     command = executable(settings)
     if settings.ocr_data_path is not None and not settings.ocr_data_path.is_dir():

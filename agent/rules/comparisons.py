@@ -1,10 +1,11 @@
 from decimal import Decimal
 
 from agent.schemas.public.results import ComparisonResult
+from agent.services.calculation_context import source_period_mismatch
 
 
 def comparison(rule_id, lhs=None, rhs=None, *, unit="KRW", refs=(), reasons=(), conflict=False):
-    reasons = list(reasons)
+    reasons = list(dict.fromkeys(reasons))
     status = (
         "needs_review" if conflict else "insufficient" if lhs is None or rhs is None or reasons else "match"
     )
@@ -45,7 +46,11 @@ def field(snapshot, key, unit=None):
     if state == "known" and not period_valid:
         reasons.append("PERIOD_MISMATCH")
         conflict = True
-    return value.value if state == "known" else None, value.evidence_refs, reasons, conflict
+    required_period = snapshot.period if key == "contract_rate" else value.period or snapshot.period
+    if state == "known" and source_period_mismatch(snapshot, value.evidence_refs, required_period):
+        reasons.append("SOURCE_PERIOD_MISMATCH")
+        conflict = True
+    return value.value if state == "known" else None, list(value.evidence_refs), reasons, conflict
 
 
 def terms(context):
@@ -61,9 +66,27 @@ def terms(context):
     meaning = not left or not right or left.time_kind is None or left.time_kind != right.time_kind
     if meaning:
         ae.append("TIME_MEANING_UNCONFIRMED")
-    if "overlapping_work_sources" in context.issues:
+    payroll_intervals = [item for item in context.normalized_intervals if item.get("payroll")]
+    br += [ref for item in payroll_intervals for ref in item["evidence_refs"]]
+    work_conflict = False
+    if "overlapping_payroll_work_sources" in context.issues:
         ae.append("WORK_SOURCE_CONFLICT")
-        ac = True
+        work_conflict = True
+    if any(issue.startswith("payroll_source_period_mismatch:") for issue in context.issues):
+        ae.append("SOURCE_PERIOD_MISMATCH")
+        work_conflict = True
+    if right and right.time_kind == "actual":
+        if any(
+            issue.startswith(("payroll_break_overlap:", "payroll_break_location_unknown:"))
+            for issue in context.issues
+        ):
+            ae.append("WORK_BREAK_UNCONFIRMED")
+            work_conflict = True
+        if payroll_intervals and b is not None and not bc and not work_conflict:
+            detailed_minutes = sum(item["minutes"] for item in payroll_intervals if not item["on_break"])
+            if detailed_minutes != b:
+                ae.append("WORK_SUMMARY_MISMATCH")
+                work_conflict = True
     minutes = comparison(
         "R-02",
         a,
@@ -71,7 +94,10 @@ def terms(context):
         unit="minute",
         refs=ar + br,
         reasons=ae + be,
-        conflict=ac or bc or (meaning and bool(left and right and left.state == right.state == "known")),
+        conflict=ac
+        or bc
+        or work_conflict
+        or (meaning and bool(left and right and left.state == right.state == "known")),
     )
     return [rate, minutes]
 
@@ -89,6 +115,9 @@ def statements(context):
             errors.append("DUPLICATE_STATEMENT_ITEM")
             conflict = True
         valid = complete and all(i.confirmed and i.amount is not None for i in detail)
+        if any(i.confirmed and source_period_mismatch(s, i.evidence_refs) for i in detail):
+            errors.append("SOURCE_PERIOD_MISMATCH")
+            conflict = True
         if not valid:
             errors.append("ITEM_SCOPE_INCOMPLETE")
         lhs = sum((i.amount for i in detail), Decimal(0)) if valid else None
@@ -123,6 +152,9 @@ def payments(context):
         conflict = True
     if any(t.amount < 0 or t.transaction_amount < 0 or t.amount > t.transaction_amount for t in selected):
         reasons.append("INVALID_ALLOCATION")
+        conflict = True
+    if any(source_period_mismatch(s, item.evidence_refs) for item in selected):
+        reasons.append("SOURCE_PERIOD_MISMATCH")
         conflict = True
     if not s.payment_scope_confirmed or not selected:
         reasons.append("PAYMENT_SCOPE_UNCONFIRMED")

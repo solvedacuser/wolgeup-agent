@@ -7,6 +7,31 @@ from agent.schemas.public.inputs import InputSnapshot
 from agent.services.hashing import digest, snapshot_hash
 
 
+def source_period_mismatch(snapshot, evidence_refs, period=None):
+    """Check declared link periods without letting unscoped manual evidence override them."""
+    period = period or snapshot.period
+    evidence = {item.evidence_id: item for item in snapshot.evidence_catalog}
+    sources = {item.source_id: item for item in snapshot.authorized_sources}
+    periods = [
+        sources[source_id].applicable_period
+        for source_id in {evidence[ref].source_id for ref in evidence_refs}
+        if sources[source_id].applicable_period is not None
+    ]
+    if not periods:
+        return False
+    # Several attendance documents may jointly cover one confirmed monthly summary.
+    if any(item.end < period.start or item.start > period.end for item in periods):
+        return True
+    covered_until = period.start
+    for item in sorted(periods, key=lambda item: item.start):
+        if item.start > covered_until:
+            return True
+        if item.end >= period.end:
+            return False
+        covered_until = max(covered_until, item.end + timedelta(days=1))
+    return True
+
+
 def build_calculation_context(snapshot: InputSnapshot, owner_id: str, case_id: str):
     if snapshot.owner_id != owner_id or snapshot.case_id != case_id:
         raise IntegrityError("Snapshot ownership does not match job")
@@ -72,17 +97,44 @@ def build_calculation_context(snapshot: InputSnapshot, owner_id: str, case_id: s
     dependencies += [f"required-period:{p.start}:{p.end}" for p in snapshot.context_requirements]
     intervals, issues = [], []
     tz = ZoneInfo(snapshot.timezone)
+    payroll_start = datetime.combine(snapshot.period.start, time.min, tz).astimezone(UTC)
+    payroll_end = datetime.combine(snapshot.period.end + timedelta(days=1), time.min, tz).astimezone(UTC)
+    payroll_records = []
     for record in sorted(snapshot.work_records, key=lambda r: (r.start_at, r.record_id)):
         start, end = record.start_at.astimezone(UTC), record.end_at.astimezone(UTC)
         if end <= start:
             raise IntegrityError("Invalid work interval")
+        payroll_source = any(
+            sources[evidence[ref].source_id].usage in ("payroll", "both") for ref in record.evidence_refs
+        )
+        scoped_start, scoped_end = max(start, payroll_start), min(end, payroll_end)
+        in_payroll = payroll_source and scoped_start < scoped_end
+        if in_payroll:
+            payroll_records.append((scoped_start, scoped_end))
+            record_period = snapshot.period.model_copy(
+                update={
+                    "start": scoped_start.astimezone(tz).date(),
+                    "end": (scoped_end - timedelta(microseconds=1)).astimezone(tz).date(),
+                }
+            )
+            if source_period_mismatch(snapshot, record.evidence_refs, record_period):
+                issues.append(f"payroll_source_period_mismatch:{record.record_id}")
         breaks = sorted((a.astimezone(UTC), b.astimezone(UTC)) for a, b in record.breaks)
         if any(a < start or b > end or b <= a for a, b in breaks):
             raise IntegrityError("Invalid break interval")
-        if any(b > c for (_, b), (c, _) in zip(breaks, breaks[1:])):
+        overlapping_breaks, latest_break_end = [], None
+        for a, b in breaks:
+            if latest_break_end is not None and a < latest_break_end:
+                overlapping_breaks.append((a, min(b, latest_break_end)))
+            latest_break_end = max(b, latest_break_end) if latest_break_end is not None else b
+        if overlapping_breaks:
             issues.append(f"break_overlap:{record.record_id}")
+            if in_payroll and any(max(a, payroll_start) < min(b, payroll_end) for a, b in overlapping_breaks):
+                issues.append(f"payroll_break_overlap:{record.record_id}")
         if not record.break_location_known:
             issues.append(f"break_location_unknown:{record.record_id}")
+            if in_payroll:
+                issues.append(f"payroll_break_location_unknown:{record.record_id}")
         boundaries = {start, end, *(x for pair in breaks for x in pair)}
         day = start.astimezone(tz).date() + timedelta(days=1)
         while datetime.combine(day, time.min, tz).astimezone(UTC) < end:
@@ -100,6 +152,7 @@ def build_calculation_context(snapshot: InputSnapshot, owner_id: str, case_id: s
                     "end": b.isoformat(),
                     "minutes": int((b - a).total_seconds() // 60),
                     "on_break": on_break,
+                    "payroll": payroll_source and payroll_start <= a and b <= payroll_end,
                     "evidence_refs": sorted(record.evidence_refs),
                 }
             )
@@ -107,6 +160,9 @@ def build_calculation_context(snapshot: InputSnapshot, owner_id: str, case_id: s
     for left, right in zip(records, records[1:]):
         if left.end_at > right.start_at:
             issues.append("overlapping_work_sources")
+    payroll_records.sort()
+    if any(left[1] > right[0] for left, right in zip(payroll_records, payroll_records[1:])):
+        issues.append("overlapping_payroll_work_sources")
     for required in snapshot.context_requirements:
         if not any(c.start <= required.start and c.end >= required.end for c in snapshot.coverage):
             issues.append(f"missing_context:{required.start}:{required.end}")

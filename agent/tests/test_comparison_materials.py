@@ -326,6 +326,116 @@ def test_no_selected_statement_or_bank_preserves_existing_manual_items():
     assert result.transaction_allocations[0].transaction_id == "manual-deposit"
 
 
+def test_subtotal_total_and_excluded_rows_do_not_double_count_or_block_complete_details():
+    from agent.rules.comparisons import statements
+
+    store = store_with(
+        (
+            "slip",
+            "payslip",
+            {
+                "earning_1_label": "기본급",
+                "earning_1_amount": "80",
+                "earning_2_label": "식대",
+                "earning_2_amount": "20",
+                "earning_3_label": "소계",
+                "earning_3_amount": "100",
+                "earning_4_label": "지급총액",
+                "earning_4_amount": None,
+                "earning_5_label": "인식 오류",
+                "earning_5_amount": None,
+            },
+        )
+    )
+    materials = build_materials(store, {"payslip_case_id": "slip"})
+    assert [r["row_role"] for r in materials["earnings"]] == [
+        "detail",
+        "detail",
+        "subtotal",
+        "total",
+        "detail",
+    ]
+    excluded_id = materials["earnings"][-1]["item_id"]
+    before = copy.deepcopy(materials)
+    result = enrich_snapshot(snapshot(), materials, {"row_roles": {excluded_id: "excluded"}})
+    assert result.earnings_complete
+    assert [r.is_total for r in result.earnings] == [False, False, True, True]
+    comparison = statements(build_calculation_context(result, result.owner_id, result.case_id))[0]
+    assert comparison.status == "match" and comparison.lhs == 100
+    assert materials == before
+    assert set(materials["earnings"][-1]["evidence_refs"]) <= {
+        item.evidence_id for item in result.evidence_catalog
+    }
+
+
+def test_user_can_correct_inferred_rollup_role_without_losing_provenance():
+    store = store_with(("slip", "payslip", {"earning_1_label": "소계", "earning_1_amount": "100"}))
+    materials = build_materials(store, {"payslip_case_id": "slip"})
+    item_id = materials["earnings"][0]["item_id"]
+    assert not enrich_snapshot(snapshot(), materials, {}).earnings_complete
+    result = enrich_snapshot(snapshot(), materials, {"row_roles": {item_id: "detail"}})
+    assert result.earnings_complete and not result.earnings[0].is_total
+    assert "user-confirmation" in result.earnings[0].evidence_refs
+    for review in ({"row_roles": {"invented": "detail"}}, {"row_roles": {item_id: "invalid"}}):
+        with pytest.raises(ValueError):
+            enrich_snapshot(snapshot(), materials, review)
+
+
+def test_manual_missing_rows_use_stable_ids_manual_evidence_and_original_page():
+    store = store_with(("slip", "payslip", {"gross": "100"}))
+    store.documents["slip"]["pages"] = 2
+    materials = build_materials(store, {"payslip_case_id": "slip"})
+    review = {
+        "manual_rows": [
+            {
+                "row_id": "added-1",
+                "group": "earnings",
+                "label": "기본급",
+                "amount": "100",
+                "row_role": "detail",
+                "page": 2,
+            }
+        ]
+    }
+    result = enrich_snapshot(snapshot(), materials, review)
+    assert result.earnings_complete and result.earnings[0].item_id == "manual-added-1"
+    evidence = next(e for e in result.evidence_catalog if e.locator == "manual-row:added-1")
+    assert evidence.source_id == "source-slip" and evidence.page == 2
+    assert evidence.verification_method == "manual_confirmed" and evidence.quote.startswith("사용자 보완:")
+    assert evidence.evidence_id in result.earnings[0].evidence_refs
+    assert "user-confirmation" in result.earnings[0].evidence_refs
+    build_calculation_context(result, result.owner_id, result.case_id)
+    assert enrich_snapshot(snapshot(), materials, review).snapshot_hash == result.snapshot_hash
+    review["manual_rows"][0]["row_role"] = "excluded"
+    excluded = enrich_snapshot(snapshot(), materials, review)
+    assert not excluded.earnings and not excluded.earnings_complete
+    assert any(e.locator == "manual-row:added-1" for e in excluded.evidence_catalog)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"page": 3},
+        {"page": True},
+        {"group": "other"},
+        {"label": "  "},
+        {"row_id": "../unsafe"},
+        {"amount": 0},
+        {"amount": "1e3"},
+        {"row_role": "guess"},
+    ],
+)
+def test_invalid_manual_statement_rows_are_rejected(change):
+    store = store_with(("slip", "payslip", {"gross": "100"}))
+    store.documents["slip"]["pages"] = 2
+    materials = build_materials(store, {"payslip_case_id": "slip"})
+    row = {"row_id": "a", "group": "earnings", "label": "기본급", "amount": "100", "page": 1}
+    with pytest.raises(ValueError):
+        enrich_snapshot(snapshot(), materials, {"manual_rows": [{**row, **change}]})
+    with pytest.raises(ValueError):
+        enrich_snapshot(snapshot(), materials, {"manual_rows": [row, row]})
+
+
 def test_equal_dates_and_amounts_are_not_deduplicated():
     values = {
         "transaction_1_date": "2026-10-25",
@@ -591,7 +701,10 @@ def test_contract_dates_never_suggest_salary_period_and_payslip_unit_sets_profil
     )
     assert build_materials(store, {"contract_case_id": "contract"})["suggested"]["period_start"] is None
     materials = build_materials(store, {"payslip_case_id": "slip"})
-    assert enrich_snapshot(snapshot(), materials, {}).profile == "M-STD"
+    assert materials["suggested"]["slip_unit"] == "KRW/month"
+    confirmed = snapshot()
+    next(field for field in confirmed.confirmed_fields if field.field_id == "slip_rate").unit = "KRW/month"
+    assert enrich_snapshot(confirmed, materials, {}).profile == "M-STD"
 
 
 def test_original_periods_attached_to_corresponding_confirmed_fields():

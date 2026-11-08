@@ -5,12 +5,12 @@ import subprocess
 import pytest
 
 from agent.config import AgentSettings
-from agent.dev.fixtures import pdf_bytes
 from agent.dev.local_workflow import LocalStore
 from agent.graphs.extraction_graph import verify_response
 from agent.schemas.public.errors import OCRFailed, OCRUnavailable
 from agent.services import local_ocr
-from agent.services.payslip_ocr import extract_payslip
+from agent.tests.fixtures_support import pdf_bytes
+from agent.tests.support.payslip_ocr import extract_payslip
 
 
 def page(*lines, confidence=95):
@@ -81,6 +81,37 @@ def test_rate_and_quantity_columns_are_not_misread_as_amounts():
     assert not any(key.endswith("_amount") for key in values)
 
 
+def test_printed_subtotals_and_totals_are_preserved_for_row_role_review():
+    from agent.services.extraction_profiles import statement_row_role
+
+    source = page(
+        "지급내역",
+        "기본급 100,000",
+        "식대 20,000",
+        "소계 120,000",
+        "총지급액 120,000",
+        "공제내역",
+        "소득세 10,000",
+        "공제 소계 10,000",
+        "공제합계 10,000",
+    )
+    response = extract_payslip([source])
+    values = by_id(response)
+    labels = [item["normalized_value"] for key, item in values.items() if key.endswith("_label")]
+    assert labels == ["기본급", "식대", "소계", "총지급액", "소득세", "공제 소계", "공제합계"]
+    assert [statement_row_role(label) for label in labels] == [
+        "detail",
+        "detail",
+        "subtotal",
+        "total",
+        "detail",
+        "subtotal",
+        "total",
+    ]
+    assert values["gross"]["normalized_value"] == "120000"
+    verify_response(response, [source["text"]], "payslip_ocr")
+
+
 def test_tsv_groups_visual_rows_across_tesseract_blocks():
     header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
     rows = [
@@ -95,37 +126,49 @@ def test_tsv_groups_visual_rows_across_tesseract_blocks():
 
 
 @pytest.mark.parametrize("scanned", [False, True])
-async def test_local_pipeline_never_calls_model_and_restores_type(tmp_path, monkeypatch, scanned):
-    class ForbiddenProvider:
-        async def invoke(self, *args):
-            pytest.fail("Python OCR must never call a model")
-
+async def test_legacy_alias_uses_ocr_then_ai_and_restores_type(tmp_path, monkeypatch, scanned):
     source = page("기본급 3,000,000", "총지급액 3,000,000", "공제합계 0", "실수령액 3,000,000")
     calls = []
+    model_calls = []
+
+    class ClassifyingProvider:
+        async def invoke(self, operation, data):
+            model_calls.append((operation, data))
+            assert calls == [[0]], "AI classification must wait for OCR fallback"
+            assert data["source_method"] == "python_ocr"
+            assert data["document_type"] == "payslip"
+            assert "pdf_bytes" not in data
+            assert data["pages"] == [source["text"]]
+            response = extract_payslip([source])
+            response["document_type"] = "payslip"
+            return response, {}
 
     def recognize(data, settings, indices):
         calls.append(indices)
         return [source]
 
     monkeypatch.setattr(local_ocr, "recognize_pdf", recognize)
+    # Exercise the legacy alias on pages whose text layer is unusable; native
+    # text is covered independently by the four-type text-first workflow tests.
+    monkeypatch.setattr("agent.services.document_ocr.read_pdf_text_page", lambda page: None)
     settings = AgentSettings(provider_mode="openai")
-    store = LocalStore(settings, state=tmp_path, provider=ForbiddenProvider())
-    case = await store.upload(
-        pdf_bytes(["Original PDF text differs from recognized text"], scanned=scanned), "payslip"
-    )
+    store = LocalStore(settings, state=tmp_path, provider=ClassifyingProvider())
+    case = await store.upload(pdf_bytes(source["text"].splitlines(), scanned=scanned), "payslip")
     case = await store.change_document_type(case["id"], "payslip_ocr")
-    job = await store.create_job(case["id"], "extract", use_saved=True)
+    job = await store.create_job(case["id"], "extract")
     await store.tasks[job["id"]]
     result = await store.get_case(case["id"])
     assert store.jobs[job["id"]]["status"] == "completed", store.jobs[job["id"]]
-    assert calls == [[0]]  # OCR is used even if the PDF has a text layer.
-    assert not store.jobs[job["id"]]["usage"] and not store.jobs[job["id"]]["call_budget"]
+    assert calls == [[0]]  # An unusable text layer falls back to OCR.
+    assert len(model_calls) == 1
+    assert store.jobs[job["id"]]["call_budget"] == {"extract_candidates": 1}
+    assert result["extraction"]["document_type"] == "payslip_ocr"
     assert result["extraction"]["recognized_pages"] == [source["text"]]
     assert result["extraction"]["verification_method"] == "ocr_unverified"
     assert all(e["verification_method"] == "ocr_unverified" for e in result["extraction"]["evidence_catalog"])
     assert result["draft"]["manual"]["gross"] == "3000000"
     assert not result["confirmed"]
-    restored = LocalStore(settings, state=tmp_path, provider=ForbiddenProvider())
+    restored = LocalStore(settings, state=tmp_path, provider=ClassifyingProvider())
     assert (await restored.get_case(case["id"])) == result
     changed = await store.change_document_type(case["id"], "payslip")
     assert changed["extraction"] is None
@@ -144,8 +187,8 @@ async def test_ocr_error_is_actionable_and_never_model_invalid(tmp_path, monkeyp
 
     monkeypatch.setattr(local_ocr, "recognize_pdf", fail)
     store = LocalStore(AgentSettings(), state=tmp_path)
-    case = await store.upload(pdf_bytes(["Synthetic PDF"]), "payslip_ocr")
-    job = await store.create_job(case["id"], "extract", use_saved=False)
+    case = await store.upload(pdf_bytes(["Synthetic scan"], scanned=True), "payslip_ocr")
+    job = await store.create_job(case["id"], "ocr")
     await store.tasks[job["id"]]
     assert store.jobs[job["id"]]["error_code"] == code
     assert store.jobs[job["id"]]["error"] == str(failure)
@@ -160,6 +203,7 @@ def test_process_timeout_and_nonzero_exit_map_to_ocr_error(monkeypatch):
         local_ocr.run(["engine"], 1)
 
 
+@pytest.mark.real_ocr
 def test_pdf_rasterization_and_stdin_ocr_contract(monkeypatch, tmp_path):
     binary = tmp_path / "engine.exe"
     binary.touch()

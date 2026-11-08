@@ -2,6 +2,7 @@
 // Presentation only: all comparison values and differences come from the Python result.
 const resultStatusNames={match:"자료상 일치",difference:"차이 발견",insufficient:"정보 부족",needs_review:"검토 필요"};
 const resultReasonNames={FIELD_MISSING:"비교할 확인값이 없습니다.",FIELD_UNKNOWN:"해당 값을 원문에서 확인해 주세요.",FIELD_PENDING:"아직 확인하지 않은 값이 있습니다.",FIELD_CONFLICT:"자료의 값이나 적용 범위가 서로 다릅니다.",UNIT_MISMATCH:"단위가 달라 바로 비교할 수 없습니다.",PERIOD_MISMATCH:"자료의 적용기간이 대조 기간과 다릅니다.",TIME_MEANING_UNCONFIRMED:"실근로시간과 유급시간 중 비교 기준을 확인해 주세요.",WORK_SOURCE_CONFLICT:"겹치는 근무기록을 확인해 주세요.",ITEM_SCOPE_INCOMPLETE:"지급·공제 세부 항목이 모두 확인되지 않았습니다.",PAYMENT_SCOPE_UNCONFIRMED:"해당 급여에 연결할 입금과 배분액을 확인해 주세요.",DUPLICATE_STATEMENT_ITEM:"중복된 명세서 항목을 확인해 주세요.",DUPLICATE_TRANSACTION:"같은 거래가 중복 연결되어 있습니다.",INVALID_ALLOCATION:"거래 금액과 배분액을 확인해 주세요."};
+Object.assign(resultReasonNames,{SOURCE_PERIOD_MISMATCH:"근거 문서에 연결한 적용기간이 이 급여 기간을 포함하지 않습니다. 문서와 적용기간을 다시 확인해 주세요.",WORK_SUMMARY_MISMATCH:"날짜별 근무기록의 실제시간 합계와 확인한 근태 총시간이 다릅니다. 상세 기록과 총시간을 대조해 주세요.",WORK_BREAK_UNCONFIRMED:"휴게시간이 겹치거나 실제 위치가 확인되지 않아 근무시간을 확정할 수 없습니다."});
 const resultRules={
   "R-01":{title:"계약 단가 대조",types:["contract","payslip"],formula:"명세서 단가 − 계약서 단가",baseline:"rhs"},
   "R-02":{title:"근무시간 대조",types:["attendance","payslip"],formula:"명세서 시간 − 근무기록 시간",baseline:"rhs"},
@@ -88,6 +89,9 @@ function renderComparisonResults() {
   for(const entry of [...(current?.analysis_history||[])].reverse()){if(entry.analysis?.result_id===current?.analysis?.result_id)continue;const option=node("option","이전 결과 · "+resultTimestamp(entry.analysis?.created_at)+" · 입력 v"+entry.analysis?.input_version);option.value=entry.analysis.result_id;versions.append(option);}versions.value=resultVersionId;versions.disabled=versions.children.length<2;versions.onchange=()=>{resultVersionId=versions.value;resultStatusFilter="all";renderResults();};
   const view=resultView();
   if(!view.analysis){
+    if(typeof isComparison==="function"&&(isComparison()||comparisonMode)){
+      const count=current?.materials?.sources?.length||0,empty=node("div",undefined,"result-empty");empty.append(node("span","↔","result-empty-icon"),node("h3",count?"문서 "+count+"건의 값을 확인해 주세요.":"어떤 문서를 비교할까요?"),node("p",count?"같은 항목을 나란히 확인하고 ‘확인한 값으로 비교’를 누르면 이곳에 결과가 표시됩니다.":"AI 처리 완료 문서를 선택한 뒤 같은 대상과 기간의 자료인지 확인하세요."));if(count){const button=node("button","비교할 값 확인으로 이동");button.type="button";button.addEventListener("click",showConfirmation);empty.append(button);}$("comparison-results").append(empty);return;
+    }
     const count=current?.materials?.sources?.length||0,ready=inputsConfirmed()&&!materialsSelectionPending(),invalid=current?.materials_invalid||materialsSelectionPending();
     const empty=node("div",undefined,"result-empty");empty.append(node("span","↔","result-empty-icon"),node("h3",invalid?"선택한 자료를 불러와 주세요.":ready?"대조할 준비가 됐습니다.":count?"자료 "+count+"건을 불러왔습니다. 값을 확인해 주세요.":"어떤 자료를 비교할까요?"),node("p",invalid?"위에서 ‘선택 자료 불러오기’를 눌러 변경한 자료를 적용하세요.":ready?"‘자료 대조’를 누르면 확인한 값으로 항목별 차이를 계산합니다.":count?"기간·금액·입금 거래를 확인하고 ‘입력값 확인’을 눌러 주세요.":"위에서 대조할 파일을 선택하고 불러온 뒤, 기간과 값을 확인해 주세요."));
     const button=node("button",ready?"자료 대조 시작":"대조할 값 확인으로 이동","primary");button.type="button";button.disabled=ready&&Boolean(busy()||loadingMaterials||changingType);button.addEventListener("click",ready?safeAction(()=>start("analyze")):showConfirmation);empty.append(button);$("comparison-results").append(empty);return;
