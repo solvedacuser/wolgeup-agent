@@ -43,7 +43,14 @@ async def test_multipage_report_has_text_and_page_footers(setup_agent):
     data = render_pdf(result, out.payload, settings, task.context.requested_at)
     reader = PdfReader(io.BytesIO(data))
     assert len(reader.pages) >= 3
+    pages = []
     for index, page in enumerate(reader.pages, 1):
         text = page.extract_text()
         assert f"월급잇다 | {index}" in text
-        assert "evidence" in text or "계약 단가" in text
+        body = text.replace(f"월급잇다 | {index}", "").strip()
+        assert len(body) > 80  # No footer-only pages or content lost during pagination.
+        pages.append(body)
+    text = "\n".join(pages)
+    for heading in ("결과 설명", "임금 항목별 계산", "자료별 대조", "보완 질문", "출처 파일", "쉬운 용어"):
+        assert heading in text
+    assert "evidence-89" in text

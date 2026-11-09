@@ -145,10 +145,16 @@ class Handler(BaseHTTPRequestHandler):
             "/ocr": ("index.html", "text/html; charset=utf-8"),
             "/ai": ("index.html", "text/html; charset=utf-8"),
             "/compare": ("index.html", "text/html; charset=utf-8"),
+            "/results": ("index.html", "text/html; charset=utf-8"),
+            "/questions": ("index.html", "text/html; charset=utf-8"),
+            "/inquiry": ("index.html", "text/html; charset=utf-8"),
+            "/reports": ("index.html", "text/html; charset=utf-8"),
+            "/glossary": ("index.html", "text/html; charset=utf-8"),
             "/styles.css": ("styles.css", "text/css; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/results.js": ("results.js", "text/javascript; charset=utf-8"),
             "/compare.js": ("compare.js", "text/javascript; charset=utf-8"),
+            "/pages.js": ("pages.js", "text/javascript; charset=utf-8"),
             "/preview.html": ("preview.html", "text/html; charset=utf-8"),
             "/preview.js": ("preview.js", "text/javascript; charset=utf-8"),
             "/preview.css": ("preview.css", "text/css; charset=utf-8"),
@@ -172,6 +178,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, {"documents": call(store.list_documents())})
         if method == "GET" and path == "/api/extraction-profiles":
             return self.respond(200, PROFILES)
+        if method == "GET" and path == "/api/glossary":
+            from agent.services.glossary import GLOSSARY_VERSION, glossary_entries
+
+            query = parse_qs(urlsplit(self.path).query)
+            return self.respond(
+                200,
+                {
+                    "version": GLOSSARY_VERSION,
+                    "entries": glossary_entries(
+                        query.get("query", [""])[0], query.get("category", [None])[0]
+                    ),
+                },
+            )
         if method == "GET" and path == "/api/comparison-sources":
             return self.respond(200, {"sources": call(store.list_comparison_sources())})
         match = re.fullmatch(r"/api/documents/([a-z0-9-]+)/pdf", path)
@@ -201,7 +220,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 return self.respond(201, call(store.create_comparison(**self.body())))
         match = re.fullmatch(
-            r"/api/(cases|comparisons)/([a-z0-9-]+)(?:/(draft|confirm|jobs|document-type|materials|candidate-selection))?",
+            r"/api/(cases|comparisons)/([a-z0-9-]+)(?:/(draft|confirm|jobs|document-type|materials|candidate-selection|inquiry|answers))?",
             path,
         )
         if match:
@@ -214,6 +233,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, call(getter(cid)))
             if method == "PUT" and action == "draft":
                 return self.respond(200, call(store.save_draft(cid, self.body())))
+            if method in ("POST", "PUT") and action == "inquiry":
+                return self.respond(200, call(store.inquiry(cid, self.body(), save=method == "PUT")))
+            if method == "PUT" and action == "answers":
+                return self.respond(200, call(store.answer_questions(cid, self.body())))
             if method == "PUT" and action == "document-type" and kind == "cases":
                 return self.respond(200, call(store.change_document_type(cid, self.body()["document_type"])))
             if method == "PUT" and action == "materials":
@@ -224,7 +247,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, call(store.select_candidate(cid, self.body())))
             if method == "POST" and action == "jobs":
                 body = self.body()
-                if set(body) - {"stage", "include_original", "field_ids", "extraction_revision"}:
+                if set(body) - {
+                    "stage",
+                    "include_original",
+                    "field_ids",
+                    "extraction_revision",
+                    "selected_source_ids",
+                    "result_id",
+                }:
                     raise ValueError("지원하지 않는 작업 요청 항목입니다.")
                 if type(body.get("include_original", False)) is not bool:
                     raise ValueError("Boolean options required")
@@ -237,6 +267,8 @@ class Handler(BaseHTTPRequestHandler):
                             include_original=body.get("include_original", False),
                             field_ids=body.get("field_ids"),
                             extraction_revision=body.get("extraction_revision"),
+                            selected_source_ids=body.get("selected_source_ids"),
+                            result_id=body.get("result_id"),
                         )
                     ),
                 )

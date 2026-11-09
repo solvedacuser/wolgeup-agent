@@ -58,10 +58,35 @@ def content_hash(data: bytes) -> str:
 
 
 def snapshot_hash(snapshot) -> str:
-    return digest(snapshot.model_dump(exclude={"snapshot_hash", "snapshot_id"}))
+    data = snapshot.model_dump(exclude={"snapshot_hash", "snapshot_id"})
+    # Additive defaults must not rewrite signed snapshots saved before wage support.
+    if data.get("wage_conditions") is None:
+        data.pop("wage_conditions", None)
+    return digest(data)
 
 
 def result_hash(result) -> str:
-    return digest(
-        result.model_dump(exclude={"result_hash", "result_id", "result_version", "freshness", "created_at"})
+    data = result.model_dump(
+        exclude={"result_hash", "result_id", "result_version", "freshness", "created_at"}
     )
+    defaults = {
+        "included_amount": None,
+        "additional_amount": None,
+        "payable_amount": None,
+        "required_field_ids": [],
+        "required_periods": [],
+        "official_sources": [],
+        "dependencies": [],
+    }
+    for item in data["wage_section"]["items"]:
+        for key, default in defaults.items():
+            if item.get(key) == default:
+                item.pop(key, None)
+    for item in data["questions"]:
+        for key, default in {"reason": "", "required_periods": [], "glossary_ids": []}.items():
+            if item.get(key) == default:
+                item.pop(key, None)
+    for item in data["comparisons"]:
+        if not item.get("wage_items"):
+            item.pop("wage_items", None)
+    return digest(data)

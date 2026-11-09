@@ -3,6 +3,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from agent.schemas.public.base import AwareDateTime, ContractModel, Money, Period
+from agent.schemas.public.wages import WageConditions
 
 
 class SourceRef(ContractModel):
@@ -111,3 +112,4 @@ class InputSnapshot(ContractModel):
     context_requirements: list[Period] = Field(default_factory=list)
     rule_bundle_version: str = "pending-v1"
     support_manifest_version: str = "pending-v1"
+    wage_conditions: WageConditions | None = None

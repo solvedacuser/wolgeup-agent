@@ -120,8 +120,14 @@ async def run_task(task, *, ports, settings, provider=None, registry=None):
         await runtime.start(sources)
         if context.task_kind == "analyze_case":
             from agent.graphs.analysis_graph import build_analysis_graph
+            from agent.rules.wages import default_rule_registry
 
-            result = await build_analysis_graph(runtime, registry or RuleRegistry()).ainvoke({})
+            selected_registry = registry
+            if selected_registry is None:
+                selected_registry = (
+                    RuleRegistry() if payload.rule_bundle_version == "pending-v1" else default_rule_registry()
+                )
+            result = await build_analysis_graph(runtime, selected_registry).ainvoke({})
             output = result["result"]
         elif context.task_kind == "extract_document":
             from agent.graphs.extraction_graph import build_extraction_graph

@@ -25,7 +25,7 @@
           "type": "string"
         },
         "engine_version": {
-          "default": "agent-0.3.0",
+          "default": "agent-0.4.0",
           "title": "Engine Version",
           "type": "string"
         }
@@ -248,6 +248,13 @@
             "type": "string"
           },
           "title": "Evidence Refs",
+          "type": "array"
+        },
+        "wage_items": {
+          "items": {
+            "$ref": "#/$defs/WageComparisonItem"
+          },
+          "title": "Wage Items",
           "type": "array"
         }
       },
@@ -526,6 +533,15 @@
           "default": "luna-v1",
           "title": "Model Config Version",
           "type": "string"
+        },
+        "generation_mode": {
+          "default": "template",
+          "enum": [
+            "template",
+            "model"
+          ],
+          "title": "Generation Mode",
+          "type": "string"
         }
       },
       "required": [
@@ -603,6 +619,89 @@
         "document_type"
       ],
       "title": "ExtractionInput",
+      "type": "object"
+    },
+    "FixedSchedule": {
+      "additionalProperties": false,
+      "properties": {
+        "days": {
+          "items": {
+            "$ref": "#/$defs/ScheduleDay"
+          },
+          "title": "Days",
+          "type": "array"
+        },
+        "week_start": {
+          "maximum": 6,
+          "minimum": 0,
+          "title": "Week Start",
+          "type": "integer"
+        },
+        "weekly_rest_weekday": {
+          "maximum": 6,
+          "minimum": 0,
+          "title": "Weekly Rest Weekday",
+          "type": "integer"
+        },
+        "weekly_rest_minutes": {
+          "maximum": 480,
+          "minimum": 0,
+          "title": "Weekly Rest Minutes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "days",
+        "week_start",
+        "weekly_rest_weekday",
+        "weekly_rest_minutes"
+      ],
+      "title": "FixedSchedule",
+      "type": "object"
+    },
+    "IncludedAllowance": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_id": {
+          "enum": [
+            "W-01",
+            "W-02",
+            "W-03",
+            "W-04",
+            "W-05"
+          ],
+          "title": "Rule Id",
+          "type": "string"
+        },
+        "amount": {
+          "title": "Amount",
+          "type": "string"
+        },
+        "state": {
+          "default": "missing",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "rule_id",
+        "amount"
+      ],
+      "title": "IncludedAllowance",
       "type": "object"
     },
     "InputSnapshot": {
@@ -745,6 +844,17 @@
           "default": "pending-v1",
           "title": "Support Manifest Version",
           "type": "string"
+        },
+        "wage_conditions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WageConditions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -877,6 +987,25 @@
           },
           "title": "Required Materials",
           "type": "array"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "required_periods": {
+          "items": {
+            "$ref": "#/$defs/Period"
+          },
+          "title": "Required Periods",
+          "type": "array"
+        },
+        "glossary_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Glossary Ids",
+          "type": "array"
         }
       },
       "required": [
@@ -887,6 +1016,89 @@
         "text"
       ],
       "title": "Question",
+      "type": "object"
+    },
+    "ReportCondition": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        },
+        "state": {
+          "default": "known",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "label",
+        "value"
+      ],
+      "title": "ReportCondition",
+      "type": "object"
+    },
+    "ReportDisplayContext": {
+      "additionalProperties": false,
+      "properties": {
+        "snapshot_id": {
+          "title": "Snapshot Id",
+          "type": "string"
+        },
+        "snapshot_hash": {
+          "title": "Snapshot Hash",
+          "type": "string"
+        },
+        "workplace_name": {
+          "title": "Workplace Name",
+          "type": "string"
+        },
+        "period": {
+          "$ref": "#/$defs/ReportPeriod"
+        },
+        "conditions": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReportCondition"
+          },
+          "title": "Conditions",
+          "type": "array"
+        },
+        "sources": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ReportSource"
+          },
+          "title": "Sources",
+          "type": "array"
+        }
+      },
+      "required": [
+        "snapshot_id",
+        "snapshot_hash",
+        "workplace_name",
+        "period"
+      ],
+      "title": "ReportDisplayContext",
       "type": "object"
     },
     "ReportInput": {
@@ -918,6 +1130,17 @@
           "default": "report-v1",
           "title": "Template Version",
           "type": "string"
+        },
+        "display_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportDisplayContext"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         }
       },
       "required": [
@@ -927,6 +1150,70 @@
         "generated_at"
       ],
       "title": "ReportInput",
+      "type": "object"
+    },
+    "ReportPeriod": {
+      "additionalProperties": false,
+      "properties": {
+        "start": {
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "ReportPeriod",
+      "type": "object"
+    },
+    "ReportSource": {
+      "additionalProperties": false,
+      "properties": {
+        "source_id": {
+          "title": "Source Id",
+          "type": "string"
+        },
+        "filename": {
+          "title": "Filename",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id",
+        "filename"
+      ],
+      "title": "ReportSource",
+      "type": "object"
+    },
+    "ScheduleDay": {
+      "additionalProperties": false,
+      "properties": {
+        "weekday": {
+          "description": "Monday=0",
+          "maximum": 6,
+          "minimum": 0,
+          "title": "Weekday",
+          "type": "integer"
+        },
+        "minutes": {
+          "maximum": 480,
+          "minimum": 1,
+          "title": "Minutes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "weekday",
+        "minutes"
+      ],
+      "title": "ScheduleDay",
       "type": "object"
     },
     "SourceRef": {
@@ -1174,6 +1461,393 @@
       "title": "TransactionAllocation",
       "type": "object"
     },
+    "WageComparisonItem": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Rule Ids",
+          "type": "array"
+        },
+        "statement_item_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Statement Item Ids",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "match",
+            "difference",
+            "insufficient",
+            "needs_review"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "lhs": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lhs"
+        },
+        "rhs": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rhs"
+        },
+        "delta": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta"
+        },
+        "reason_codes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reason Codes",
+          "type": "array"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "independent": {
+          "default": true,
+          "title": "Independent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "rule_ids",
+        "statement_item_ids",
+        "status"
+      ],
+      "title": "WageComparisonItem",
+      "type": "object"
+    },
+    "WageCondition_Annotated_Decimal__BeforeValidator__": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "default": "missing",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "confirmation_id": {
+          "default": "",
+          "title": "Confirmation Id",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "title": "WageCondition[Annotated[Decimal, BeforeValidator]]",
+      "type": "object"
+    },
+    "WageCondition_FixedSchedule_": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "default": "missing",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FixedSchedule"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "confirmation_id": {
+          "default": "",
+          "title": "Confirmation Id",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "title": "WageCondition[FixedSchedule]",
+      "type": "object"
+    },
+    "WageCondition_bool_": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "default": "missing",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "confirmation_id": {
+          "default": "",
+          "title": "Confirmation Id",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "title": "WageCondition[bool]",
+      "type": "object"
+    },
+    "WageCondition_int_": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "default": "missing",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "confirmation_id": {
+          "default": "",
+          "title": "Confirmation Id",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "title": "WageCondition[int]",
+      "type": "object"
+    },
+    "WageConditions": {
+      "additionalProperties": false,
+      "description": "Missing facts block only the rules that need them; no inferred 209-hour divisor.",
+      "properties": {
+        "standard_employment": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "contract_unchanged": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "five_or_more_workers": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "full_period_employment": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "records_complete": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "composition_complete": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "monthly_weekly_rest_included": {
+          "$ref": "#/$defs/WageCondition_bool_"
+        },
+        "ordinary_hourly_rate": {
+          "$ref": "#/$defs/WageCondition_Annotated_Decimal__BeforeValidator__"
+        },
+        "ordinary_monthly_amount": {
+          "$ref": "#/$defs/WageCondition_Annotated_Decimal__BeforeValidator__"
+        },
+        "monthly_standard_minutes": {
+          "$ref": "#/$defs/WageCondition_int_"
+        },
+        "schedule": {
+          "$ref": "#/$defs/WageCondition_FixedSchedule_"
+        },
+        "days": {
+          "items": {
+            "$ref": "#/$defs/WageDay"
+          },
+          "title": "Days",
+          "type": "array"
+        },
+        "included_allowances": {
+          "items": {
+            "$ref": "#/$defs/IncludedAllowance"
+          },
+          "title": "Included Allowances",
+          "type": "array"
+        },
+        "statement_mappings": {
+          "items": {
+            "$ref": "#/$defs/WageStatementMapping"
+          },
+          "title": "Statement Mappings",
+          "type": "array"
+        },
+        "calculation_period": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Period"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "WageConditions",
+      "type": "object"
+    },
+    "WageDay": {
+      "additionalProperties": false,
+      "properties": {
+        "date": {
+          "format": "date",
+          "title": "Date",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "workday",
+            "unpaid_rest",
+            "paid_holiday",
+            "weekly_rest"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "attendance": {
+          "enum": [
+            "present",
+            "absent",
+            "paid_leave",
+            "not_scheduled",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "Attendance",
+          "type": "string"
+        },
+        "confirmed": {
+          "default": false,
+          "title": "Confirmed",
+          "type": "boolean"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "date",
+        "kind",
+        "attendance"
+      ],
+      "title": "WageDay",
+      "type": "object"
+    },
     "WageItemResult": {
       "additionalProperties": false,
       "properties": {
@@ -1247,6 +1921,70 @@
           },
           "title": "Operands",
           "type": "object"
+        },
+        "included_amount": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Included Amount"
+        },
+        "additional_amount": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Additional Amount"
+        },
+        "payable_amount": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payable Amount"
+        },
+        "required_field_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Field Ids",
+          "type": "array"
+        },
+        "required_periods": {
+          "items": {
+            "$ref": "#/$defs/Period"
+          },
+          "title": "Required Periods",
+          "type": "array"
+        },
+        "official_sources": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Official Sources",
+          "type": "array"
+        },
+        "dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependencies",
+          "type": "array"
         }
       },
       "required": [
@@ -1293,6 +2031,61 @@
         "subtotal"
       ],
       "title": "WageSection",
+      "type": "object"
+    },
+    "WageStatementMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_ids": {
+          "items": {
+            "enum": [
+              "W-01",
+              "W-02",
+              "W-03",
+              "W-04",
+              "W-05"
+            ],
+            "type": "string"
+          },
+          "title": "Rule Ids",
+          "type": "array"
+        },
+        "statement_item_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Statement Item Ids",
+          "type": "array"
+        },
+        "period": {
+          "$ref": "#/$defs/Period"
+        },
+        "state": {
+          "default": "missing",
+          "enum": [
+            "known",
+            "missing",
+            "unknown",
+            "pending",
+            "conflict"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "rule_ids",
+        "statement_item_ids",
+        "period"
+      ],
+      "title": "WageStatementMapping",
       "type": "object"
     },
     "WorkRecord": {

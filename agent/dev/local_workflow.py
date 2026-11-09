@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pypdf import PdfReader
 
 from agent import run_task
-from agent.config import ENGINE_VERSION
+from agent.config import ENGINE_VERSION, EXTRACTION_COMPATIBILITY_VERSION
 from agent.dev.candidate_selection import (
     clear_candidates,
     initialize_candidates,
@@ -23,6 +23,7 @@ from agent.dev.candidate_selection import (
     supplement_targets,
     validate_supplement_lineage,
 )
+from agent.dev.payroll_pages import archive_current, result_entry, sources_for_entry
 from agent.ports.local import LocalFilePorts
 from agent.schemas.public.base import Period
 from agent.schemas.public.errors import AgentError, IntegrityError, JobCancelled
@@ -33,6 +34,7 @@ from agent.schemas.public.inputs import (
     SourceRef,
     StatementItem,
     TransactionAllocation,
+    WorkRecord,
 )
 from agent.schemas.public.results import AnalysisResult, ExplanationCandidate
 from agent.schemas.public.tasks import (
@@ -43,6 +45,7 @@ from agent.schemas.public.tasks import (
     JobContext,
     ReportInput,
 )
+from agent.schemas.public.wages import WageConditions
 from agent.services.extraction_profiles import CONTRACT_FIELDS, validate_document_type
 from agent.services.extraction_review import candidate_value, row_requires_replacement
 from agent.services.facts import allowed_facts
@@ -159,6 +162,9 @@ class Confirmation(BaseModel):
     deductions_complete: bool = False
     payment_scope_confirmed: bool = False
     material_review: MaterialReview = Field(default_factory=MaterialReview)
+    wage_conditions: WageConditions | None = None
+    work_records: list[WorkRecord] = Field(default_factory=list, max_length=1000)
+    coverage: list[Period] = Field(default_factory=list, max_length=100)
 
     @field_validator("manual")
     @classmethod
@@ -217,7 +223,7 @@ def extraction_draft(payload):
     """Keep generated candidates separate from the user's working confirmation."""
     data = payload if isinstance(payload, dict) else payload.model_dump(mode="json")
     fields = {field["field_id"]: field for field in data.get("fields", [])}
-    draft = Confirmation().model_dump()
+    draft = Confirmation().model_dump(mode="json")
     draft["values"] = {key: candidate_value(field) for key, field in fields.items() if key in FIELDS}
     if data.get("document_type") != "contract":
         draft["manual"] = {
@@ -290,13 +296,13 @@ def merge_extraction_draft(current, baseline, candidate, confirmed=None):
     # New rows and transactions always need a fresh completeness/scope confirmation.
     for key in ("earnings_complete", "deductions_complete", "payment_scope_confirmed"):
         draft[key] = False
-    return Confirmation.model_validate(draft).model_dump(), changes
+    return Confirmation.model_validate(draft).model_dump(mode="json"), changes
 
 
 def make_snapshot(case, document_ref, confirmation):
     period = Period(start=confirmation.period_start, end=confirmation.period_end)
     version = case["confirmed_revision"]
-    manual_data = str(confirmation.model_dump()).encode()
+    manual_data = str(confirmation.model_dump(mode="json")).encode()
     manual_ref = SourceRef(
         source_id=identifier("manual"),
         owner_id="owner-local",
@@ -397,7 +403,29 @@ def make_snapshot(case, document_ref, confirmation):
         ]
         if manual.get("deposit") not in (None, "")
         else [],
+        wage_conditions=confirmation.wage_conditions,
+        work_records=confirmation.work_records,
+        coverage=confirmation.coverage,
+        rule_bundle_version="standard-wages-v1",
+        support_manifest_version="standard-wages-manifest-v1",
     )
+    # User-confirmed structured edits have their own immutable manual source.
+    # Original evidence is retained when the edit already points to a selected document.
+    if snapshot.wage_conditions is not None:
+        wage_data = snapshot.wage_conditions.model_dump(mode="json")
+        for value in wage_data.values():
+            entries = value if isinstance(value, list) else [value]
+            for entry in entries:
+                if not isinstance(entry, dict) or "evidence_refs" not in entry:
+                    continue
+                if not entry["evidence_refs"]:
+                    entry["evidence_refs"] = [evidence.evidence_id]
+                if "confirmation_id" in entry:
+                    entry["confirmation_id"] = entry["confirmation_id"] or evidence.evidence_id
+        snapshot.wage_conditions = WageConditions.model_validate(wage_data)
+    for record in snapshot.work_records:
+        if not record.evidence_refs:
+            record.evidence_refs = [evidence.evidence_id]
     snapshot.snapshot_hash = snapshot_hash(snapshot)
     return snapshot, manual_ref, manual_data
 
@@ -459,11 +487,17 @@ class LocalStore:
             case.setdefault("analysis_history", [])
             case.setdefault("extraction_changes", [])
             case.setdefault("draft_history", [])
+            archive_current(case)
             case["extraction_needs_review"] = bool(
-                case.get("extraction") and case.get("extraction_engine_version") != ENGINE_VERSION
+                case.get("extraction")
+                and (
+                    case.get("extraction_compatibility_version", EXTRACTION_COMPATIBILITY_VERSION)
+                    != EXTRACTION_COMPATIBILITY_VERSION
+                    or case["extraction"].get("extraction_version") not in {"1.0", "1.1", "1.2"}
+                )
             )
             if case.get("analysis") and case["analysis"].get("engine_version") != ENGINE_VERSION:
-                case.update(stale=True, explanation=None, report=None)
+                case.update(stale=True)
         for job in self.jobs.values():
             if job["status"] in ("queued", "running"):
                 job.update(status="interrupted", error="서버가 중단되었습니다. 이어서 실행할 수 있습니다.")
@@ -481,18 +515,89 @@ class LocalStore:
 
     def _record_view(self, case):
         result = copy.deepcopy(case)
+        if case.get("analysis"):
+            result["report_sources"] = sources_for_entry(self, result_entry(case))
+            rid = case["analysis"]["result_id"]
+            result["inquiry"] = copy.deepcopy(case.get("inquiries", {}).get(rid))
+        for entry in result.get("analysis_history", []):
+            entry["report_sources"] = sources_for_entry(self, entry)
+            entry["inquiry"] = copy.deepcopy(case.get("inquiries", {}).get(entry["analysis"]["result_id"]))
         if case.get("kind") == "comparison":
             from agent.dev.comparison_context import comparison_compatibility
 
             result["compatibility"] = comparison_compatibility(case.get("materials"), case["draft"])
         return result
 
+    async def inquiry(self, case_id, request, *, save=False):
+        from agent.dev.payroll_pages import generate_inquiry, save_inquiry
+
+        case = self._record(case_id)
+        (save_inquiry if save else generate_inquiry)(case, request)
+        self.save_case(case)
+        return self._record_view(case)
+
+    async def answer_questions(self, case_id, request):
+        case = self._record(case_id)
+        self._refresh_materials(case)
+        if case.get("dirty") or case.get("stale"):
+            raise ComparisonInputError(
+                "입력이 변경되었습니다. 변경한 입력을 확인하고 재계산한 뒤 질문에 답해 주세요."
+            )
+        if set(request) - {"result_id", "answers", "confirm"}:
+            raise ComparisonInputError("지원하지 않는 답변 형식입니다.")
+        entry = result_entry(case, request.get("result_id"))
+        if entry["analysis"]["result_id"] != case["analysis"]["result_id"]:
+            raise ComparisonInputError("과거 결과의 질문은 최신 결과에서 다시 확인해 주세요.")
+        questions = {q["question_id"]: q for q in entry["analysis"]["questions"]}
+        answers = request.get("answers")
+        if not isinstance(answers, list) or not answers or len(answers) > 100:
+            raise ComparisonInputError("확인할 답변을 입력해 주세요.")
+        draft = copy.deepcopy(case["draft"])
+        wage = draft.get("wage_conditions") or WageConditions().model_dump(mode="json")
+        for answer in answers:
+            if not isinstance(answer, dict) or set(answer) - {"question_id", "field_id", "state", "value"}:
+                raise ComparisonInputError("답변 형식을 확인해 주세요.")
+            question = questions.get(answer.get("question_id"))
+            field = answer.get("field_id", "").removeprefix("wage_conditions.")
+            allowed = [
+                key.removeprefix("wage_conditions.") for key in (question or {}).get("target_field_ids", [])
+            ]
+            if (
+                question is None
+                or field not in allowed
+                or not isinstance(wage.get(field), dict)
+                or "state" not in wage[field]
+            ):
+                raise ComparisonInputError("이 질문은 관련 입력 화면에서 자료와 함께 확인해 주세요.")
+            state = answer.get("state", "known")
+            wage[field] = {
+                "state": state,
+                "value": answer.get("value") if state == "known" else None,
+                "confirmation_id": "",
+                "evidence_refs": [],
+            }
+        draft["wage_conditions"] = WageConditions.model_validate(wage).model_dump(mode="json")
+        await self.save_draft(case_id, draft)
+        case.setdefault("question_answers", []).append(
+            {
+                "result_id": entry["analysis"]["result_id"],
+                "answers": copy.deepcopy(answers),
+                "confirmed": request.get("confirm") is True,
+                "revision": case["revision"],
+                "saved_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        if request.get("confirm") is True:
+            return await self.confirm(case_id)
+        self.save_case(case)
+        return self._record_view(case)
+
     def _validate_comparison_context(self, case, confirmation):
         if case.get("kind") != "comparison":
             return
         from agent.dev.comparison_context import comparison_compatibility
 
-        compatibility = comparison_compatibility(case.get("materials"), confirmation.model_dump())
+        compatibility = comparison_compatibility(case.get("materials"), confirmation.model_dump(mode="json"))
         blocking = next(
             (issue for issue in compatibility.get("issues", []) if issue.get("severity") == "blocking"), None
         )
@@ -568,7 +673,7 @@ class LocalStore:
                 ) from exc
             candidate = material_candidate(draft, materials)
             if previous and same_selection(previous["selection"], materials["selection"]):
-                baseline = material_candidate(Confirmation().model_dump(), previous)
+                baseline = material_candidate(Confirmation().model_dump(mode="json"), previous)
                 draft, changes = merge_extraction_draft(
                     case["draft"], baseline, candidate, case.get("confirmed")
                 )
@@ -592,7 +697,7 @@ class LocalStore:
                     )
                     draft["material_review"] = review
                     materials["warnings"] = list(dict.fromkeys(materials["warnings"] + warnings))
-        if previous or case["draft"] != Confirmation().model_dump():
+        if previous or case["draft"] != Confirmation().model_dump(mode="json"):
             case.setdefault("draft_history", []).append(
                 {
                     "revision": case["revision"],
@@ -630,7 +735,7 @@ class LocalStore:
             materials_revision=case["revision"] + 1,
             materials_invalid=False,
             confirmed_materials=None,
-            draft=Confirmation.model_validate(draft).model_dump(),
+            draft=Confirmation.model_validate(draft).model_dump(mode="json"),
             confirmed=None,
             confirmed_revision=None,
             dirty=True,
@@ -782,9 +887,25 @@ class LocalStore:
         )
 
     async def list_documents(self):
-        return [
-            {k: d[k] for k in ("id", "kind", "category", "title", "pages")} for d in self.documents.values()
-        ]
+        documents = []
+        for document in self.documents.values():
+            candidates = [case for case in self.cases.values() if case.get("document_id") == document["id"]]
+            selected = max(
+                candidates,
+                key=lambda case: (
+                    bool(case.get("extraction")),
+                    case.get("revision", 0),
+                    case.get("extraction_revision", 0),
+                ),
+                default=None,
+            )
+            documents.append(
+                {
+                    **{key: document[key] for key in ("id", "kind", "category", "title", "pages")},
+                    "case_id": selected["id"] if selected else None,
+                }
+            )
+        return documents
 
     def _new_record(self, record_id, doc_id, document_type):
         return {
@@ -795,7 +916,7 @@ class LocalStore:
             "revision": 1,
             "confirmed_revision": None,
             "dirty": True,
-            "draft": Confirmation().model_dump(),
+            "draft": Confirmation().model_dump(mode="json"),
             "confirmed": None,
             "extraction": None,
             "extraction_a": None,
@@ -842,7 +963,7 @@ class LocalStore:
         case.update(
             kind="comparison",
             title=title.strip() or "새 비교 묶음",
-            draft=confirmation.model_dump(),
+            draft=confirmation.model_dump(mode="json"),
             created_at=datetime.now(UTC).isoformat(),
         )
         self.comparisons[case["id"]] = case
@@ -899,7 +1020,7 @@ class LocalStore:
             document_type=document_type,
             document_type_revision=case["revision"] + 1,
             extraction=None,
-            draft=Confirmation().model_dump(),
+            draft=Confirmation().model_dump(mode="json"),
             confirmed=None,
             confirmed_revision=None,
             dirty=True,
@@ -970,7 +1091,7 @@ class LocalStore:
         case = self._record(case_id)
         self._validate_material_review(case, confirmation)
         case.update(
-            draft=confirmation.model_dump(),
+            draft=confirmation.model_dump(mode="json"),
             revision=case["revision"] + 1,
             dirty=True,
             stale=bool(case["analysis"]),
@@ -998,7 +1119,7 @@ class LocalStore:
         self._validate_material_review(case, confirmation, allocations=True)
         self._validate_comparison_context(case, confirmation)
         case.update(
-            confirmed=confirmation.model_dump(),
+            confirmed=confirmation.model_dump(mode="json"),
             confirmed_revision=case["revision"],
             confirmed_materials=copy.deepcopy(case.get("materials")),
             dirty=False,
@@ -1023,10 +1144,20 @@ class LocalStore:
         )
 
     async def create_job(
-        self, case_id, stage, *, include_original=False, field_ids=None, extraction_revision=None
+        self,
+        case_id,
+        stage,
+        *,
+        include_original=False,
+        field_ids=None,
+        extraction_revision=None,
+        selected_source_ids=None,
+        result_id=None,
     ):
         if stage not in ("ocr", "extract", "supplement", "analyze", "explain", "report"):
             raise ValueError("알 수 없는 작업입니다.")
+        if stage != "report" and (selected_source_ids is not None or result_id is not None):
+            raise ComparisonInputError("원본 선택과 과거 결과 선택은 보고서 작업에만 사용할 수 있습니다.")
         if stage != "supplement" and (field_ids is not None or extraction_revision is not None):
             raise ComparisonInputError("보완 항목은 원문 보완 작업에서만 지정할 수 있습니다.")
         case = self._record(case_id)
@@ -1055,14 +1186,19 @@ class LocalStore:
                     raise ValueError("저장 OCR이 변경되었습니다. 기본 항목 정리를 다시 실행해 주세요.")
             except ValueError as exc:
                 raise ComparisonInputError(str(exc)) from exc
-        if stage not in ("ocr", "extract", "supplement") and (
-            case["dirty"] or case["confirmed_revision"] is None
+        historical_report = stage == "report" and result_id is not None
+        if (
+            stage not in ("ocr", "extract", "supplement")
+            and not historical_report
+            and (case["dirty"] or case["confirmed_revision"] is None)
         ):
             raise ValueError("수정한 값을 먼저 확인해 주세요.")
-        if stage in ("explain", "report") and (not case["analysis"] or case["stale"]):
+        if (
+            stage in ("explain", "report")
+            and not historical_report
+            and (not case["analysis"] or case["stale"])
+        ):
             raise ValueError("최신 입력으로 대조를 실행해 주세요.")
-        if stage == "report" and not case["explanation"]:
-            raise ValueError("설명을 먼저 생성해 주세요.")
         jid = identifier("job")
         kind = {
             "extract": "extract_document",
@@ -1111,7 +1247,11 @@ class LocalStore:
                 )
             manual_sources = [{"ref": manual_ref.model_dump(mode="json"), "data": manual_data.decode()}]
             payload = AnalysisJobInput(
-                snapshot=snapshot, snapshot_id=snapshot.snapshot_id, snapshot_hash=snapshot.snapshot_hash
+                snapshot=snapshot,
+                snapshot_id=snapshot.snapshot_id,
+                snapshot_hash=snapshot.snapshot_hash,
+                rule_bundle_version=snapshot.rule_bundle_version,
+                support_manifest_version=snapshot.support_manifest_version,
             )
         elif stage == "explain":
             result = AnalysisResult.model_validate(case["analysis"])
@@ -1121,21 +1261,46 @@ class LocalStore:
                 model_config_version=self.settings.model_config_version,
             )
         else:
-            result = AnalysisResult.model_validate(case["analysis"])
+            from agent.dev.payroll_pages import report_context
+            from agent.services.facts import template_explanation
+
+            entry = result_entry(case, result_id)
+            result = AnalysisResult.model_validate(entry["analysis"])
+            if case.get("stale") or case.get("dirty") or result.result_id != case["analysis"]["result_id"]:
+                result.freshness = "stale"
+            snapshot_sources = (entry.get("snapshot") or {}).get("authorized_sources", [])
+            available = {
+                s["source_id"]: SourceRef.model_validate(s)
+                for s in snapshot_sources
+                if s.get("kind", "document") == "document"
+            }
+            if not available:
+                available = {
+                    s["ref"]["source_id"]: SourceRef.model_validate(s["ref"])
+                    for s in (entry.get("materials") or {}).get("sources", [])
+                }
+            if not available and ref is not None:
+                available = {ref.source_id: ref}
+            selected = list(available) if include_original else []
+            if selected_source_ids is not None:
+                if (
+                    not isinstance(selected_source_ids, list)
+                    or any(not isinstance(s, str) for s in selected_source_ids)
+                    or len(selected_source_ids) != len(set(selected_source_ids))
+                    or set(selected_source_ids) - set(available)
+                ):
+                    raise ComparisonInputError("이번 결과에 사용한 원본 문서만 선택해 주세요.")
+                selected = selected_source_ids
+            display = report_context(self, case, entry)
             payload = ReportInput(
                 result=result,
-                explanation=ExplanationCandidate.model_validate(case["explanation"]),
-                explanation_version=str(case["confirmed_revision"]),
-                selected_sources=list(
-                    {
-                        s["ref"]["source_id"]: SourceRef.model_validate(s["ref"])
-                        for s in (case.get("confirmed_materials") or {}).get("sources", [])
-                    }.values()
-                )
-                if include_original and case.get("confirmed_materials")
-                else [ref]
-                if include_original and ref is not None
-                else [],
+                explanation=ExplanationCandidate.model_validate(entry["explanation"])
+                if entry.get("explanation")
+                else template_explanation(result),
+                explanation_version=str(result.result_version),
+                selected_sources=[available[s] for s in selected],
+                display_context=display,
+                template_version="report-v2" if display else "report-v1",
                 generated_at=datetime.now(UTC),
             )
         task = AgentTask(context=context, payload=payload)
@@ -1159,7 +1324,7 @@ class LocalStore:
             if stage in ("extract", "supplement")
             else "Python 규칙"
             if stage == "analyze"
-            else self.settings.explanation_model,
+            else "검수 문구·보고서 서식",
             "material_versions": copy.deepcopy((case.get("materials") or {}).get("source_versions", {})),
             "created_at": datetime.now(UTC).isoformat(),
         }
@@ -1452,9 +1617,9 @@ class LocalStore:
             previous = case.get("extraction")
             candidate = extraction_draft(payload)
             baseline = case.get("extraction_draft") or (
-                extraction_draft(previous) if previous else Confirmation().model_dump()
+                extraction_draft(previous) if previous else Confirmation().model_dump(mode="json")
             )
-            if previous or case["draft"] != Confirmation().model_dump():
+            if previous or case["draft"] != Confirmation().model_dump(mode="json"):
                 case.setdefault("draft_history", []).append(
                     {
                         "revision": case["revision"],
@@ -1489,6 +1654,7 @@ class LocalStore:
                 draft=draft,
                 extraction_draft=candidate,
                 extraction_engine_version=ENGINE_VERSION,
+                extraction_compatibility_version=EXTRACTION_COMPATIBILITY_VERSION,
                 extraction_needs_review=False,
                 extraction_changes=changes,
                 revision=case["revision"] + 1,
@@ -1499,6 +1665,9 @@ class LocalStore:
             )
             self._invalidate_material_dependents(case["id"])
         elif stage == "analyze":
+            from agent.services.facts import template_explanation
+
+            archive_current(case)
             history = case.setdefault("analysis_history", [])
             if case["analysis"] and not any(
                 entry["analysis"]["result_id"] == case["analysis"]["result_id"] for entry in history
@@ -1520,21 +1689,45 @@ class LocalStore:
                 freshness="current",
                 created_at=datetime.now(UTC),
             )
-            case.update(analysis=result.model_dump(mode="json"), explanation=None, report=None, stale=False)
+            case.update(
+                analysis=result.model_dump(mode="json"),
+                explanation=template_explanation(result).model_dump(mode="json"),
+                report=None,
+                stale=False,
+            )
             case["analysis_materials"] = copy.deepcopy(case.get("confirmed_materials"))
             case["analysis_snapshot"] = snapshot
+            case["analysis_confirmed"] = copy.deepcopy(case.get("confirmed"))
+            identities = (case.get("confirmed") or {}).get("source_identity", {})
+            names = {
+                identities.get(s["case_id"], {}).get("employer_name")
+                or s.get("identity", {}).get("employer_name")
+                for s in (case.get("analysis_materials") or {}).get("sources", [])
+            } - {None, ""}
+            case["analysis_workplace_name"] = " · ".join(sorted(names)) or "사업장 미확인"
             history.append(
                 {
                     "analysis": copy.deepcopy(case["analysis"]),
                     "period": copy.deepcopy(snapshot["period"]),
                     "materials": copy.deepcopy(case["analysis_materials"]),
                     "snapshot": snapshot,
+                    "confirmed": copy.deepcopy(case["analysis_confirmed"]),
+                    "workplace_name": case["analysis_workplace_name"],
                 }
             )
+            case["report_sources"] = sources_for_entry(self, result_entry(case))
+            archive_current(case)
         elif stage == "explain":
             case.update(explanation=payload.model_dump(mode="json"), report=None)
+            archive_current(case)
         else:
-            case["report"] = payload.model_dump(mode="json")
+            report = payload.model_dump(mode="json")
+            case.setdefault("report_history", []).append(copy.deepcopy(report))
+            if case["analysis"]["result_id"] == payload.result_id:
+                case["report"] = report
+                archive_current(case)
+            else:
+                result_entry(case, payload.result_id)["report"] = report
             for artifact in payload.artifacts:
                 self.jobs[job["id"]].setdefault("downloads", []).append(
                     {
@@ -1547,12 +1740,17 @@ class LocalStore:
     async def artifact(self, artifact_id):
         for case in self._all_records():
             self._refresh_materials(case)
-            if case["report"] and not case["stale"] and not case["dirty"]:
-                for value in case["report"]["artifacts"]:
+            reports = [
+                case.get("report"),
+                *case.get("report_history", []),
+                *[entry.get("report") for entry in case.get("analysis_history", [])],
+            ]
+            for report in reports:
+                for value in (report or {}).get("artifacts", []):
                     if value["artifact_id"] == artifact_id:
                         from agent.schemas.public.results import ArtifactRef
 
                         ref = ArtifactRef.model_validate(value)
                         ports = LocalFilePorts(directory=self.state / "artifacts-and-checkpoints")
                         return ports.artifact_bytes(ref), ref.mime_type
-        raise KeyError("최신 산출물을 찾을 수 없습니다.")
+        raise KeyError("저장된 산출물을 찾을 수 없습니다.")

@@ -7,7 +7,7 @@ let identityInputs=new Map();
 function isComparison(record=current) {return record?.kind==="comparison";}
 function caseApiPath(record=current) {return (isComparison(record)?"/api/comparisons/":"/api/cases/")+record.id;}
 function syncActiveRecord() {if(isComparison())comparisonCase=current;else if(current)documentCase=current;}
-function rememberComparison() {if(!isComparison())return;comparisonCase=current;localStorage.setItem("agent-last-comparison",current.id);history.replaceState(null,"",routeUrl("compare"));updateRouteLinks();}
+function rememberComparison() {if(!isComparison())return;comparisonCase=current;localStorage.setItem("agent-last-comparison",current.id);routeComparisonId=current.id;history.replaceState(null,"",routeUrl(activeRoute));updateRouteLinks();}
 function emptyComparisonSelection() {return {contract_case_id:null,attendance_case_ids:[],payslip_case_id:null,deposit_case_ids:[]};}
 function selectedComparisonSources() {const ids=new Set(Object.values(comparisonSelection).flat().filter(Boolean));return (comparisonSources||[]).filter(source=>ids.has(source.case_id));}
 function sameComparisonSelection(left,right) {return Object.keys(emptyComparisonSelection()).every(key=>Array.isArray(left[key])?JSON.stringify([...left[key]].sort())===JSON.stringify([...(right?.[key]||[])].sort()):(left[key]||null)===(right?.[key]||null));}
@@ -17,11 +17,13 @@ function renderComparisonList() {
   for(const item of comparisonRecords){const option=node("option",(item.title||"문서 비교")+(item.draft?.period_start?" · "+item.draft.period_start:""));option.value=item.id;select.append(option);}select.value=comparisonCase?.id||"";
 }
 async function openComparison(id) {
+  if(id&&id!==routeComparisonId){routeResultId="";resultVersionId="";}
+  routeComparisonId=id||"";
   if(loadingMaterials||comparisonSubmitting||candidateRequestPending)return;
   await flushDraft();syncActiveRecord();clearTimeout(pollTimer);currentJob=null;
   comparisonMode=true;
   if(id){current=comparisonCase=await api("/api/comparisons/"+encodeURIComponent(id));comparisonSelection=structuredClone(current.materials?.selection||emptyComparisonSelection());rememberComparison();renderCase();await restoreCurrentJob();}
-  else{current=comparisonCase=null;comparisonSelection=emptyComparisonSelection();localStorage.removeItem("agent-last-comparison");history.replaceState(null,"",routeUrl("compare"));$("comparison-title").value="";renderComparisonPicker();renderResults();updateControls();}
+  else{current=comparisonCase=null;comparisonSelection=emptyComparisonSelection();localStorage.removeItem("agent-last-comparison");history.replaceState(null,"",routeUrl(activeRoute));$("comparison-title").value="";renderComparisonPicker();renderResults();updateControls();}
   renderComparisonList();renderRoute();
 }
 function comparisonKind(source) {return source.document_type==="payslip_ocr"?"payslip":source.document_type;}
@@ -78,7 +80,7 @@ function renderComparisonPicker() {
   $("comparison-review-state").textContent=isComparison()?(inputsConfirmed()?"이번 비교 입력 확인 완료":"이번 비교 입력 확인 전"):"문서를 고르면 같은 항목을 나란히 확인할 수 있습니다.";
   $("materials-panel").hidden=true;$("comparison-picker").hidden=false;
 }
-function supplementSourceLink(source) {const link=node("a","미확인 항목 보완 →","supplement-follow-link");link.href="/ai?case="+encodeURIComponent(source.case_id);link.addEventListener("click",safeAction(async event=>{event.preventDefault();if(busy()||loadingMaterials||comparisonSubmitting)return;await flushDraft();syncActiveRecord();const record=await api("/api/cases/"+encodeURIComponent(source.case_id));clearTimeout(pollTimer);currentJob=null;current=documentCase=record;activeRoute="ai";comparisonMode=false;rememberCase();renderCase();renderRoute();await restoreCurrentJob();}));return link;}
+function supplementSourceLink(source) {const link=node("a","미확인 항목 보완 →","supplement-follow-link");link.href="/ai?case="+encodeURIComponent(source.case_id)+(comparisonCase?"&comparison="+encodeURIComponent(comparisonCase.id):"")+(routeResultId?"&result="+encodeURIComponent(routeResultId):"");link.addEventListener("click",safeAction(async event=>{event.preventDefault();if(busy()||loadingMaterials||comparisonSubmitting)return;await flushDraft();syncActiveRecord();const record=await api("/api/cases/"+encodeURIComponent(source.case_id));clearTimeout(pollTimer);currentJob=null;current=documentCase=record;activeRoute="ai";comparisonMode=false;rememberCase();renderCase();renderRoute();await restoreCurrentJob();}));return link;}
 async function applyComparisonSelection() {
   if(loadingMaterials||comparisonSubmitting)return;
   if(!selectedComparisonSources().length)return;
@@ -114,6 +116,40 @@ function comparisonHasBlockingIssues() {
   if(["employee_name","employee_id","employer_name"].some(key=>new Set(identities.map(value=>normalizedIdentity(value[key])).filter(Boolean)).size>1))return true;
   return !pendingDraft&&Boolean(current.compatibility?.blocked);
 }
+function comparisonActionBlockers({running,invalid,selectionPending,duplicateReviewNeeded,incompleteRows}) {
+  if(!isComparison())return [];
+  const messages=[];
+  if(running||comparisonSubmitting)messages.push("자료를 처리하고 있습니다. 처리가 끝나면 비교할 수 있습니다.");
+  if(invalid)messages.push("연결한 원본이 변경되었습니다. 선택한 문서를 다시 적용해 주세요.");
+  if(selectionPending)messages.push("문서 선택이 변경되었습니다. 먼저 ‘선택 문서 적용’을 눌러 주세요.");
+  if(!current.materials?.sources?.length)messages.push("대조할 문서를 선택하고 적용해 주세요.");
+  if(duplicateReviewNeeded)messages.push("중복으로 보이는 입금 거래가 있습니다. 거래 목록에서 중복 여부를 확인해 주세요.");
+  if(incompleteRows)messages.push("직접 추가한 항목의 이름과 원문 페이지를 확인해 주세요.");
+  if(!$("same-subject-confirmed").checked)messages.push("같은 근로자·사업장에 관한 자료인지 원문에서 확인한 뒤 체크해 주세요.");
+  if(comparisonHasBlockingIssues()){
+    const identities=Object.values(readResolvedSourceIdentity());let identityConflict=false;
+    for(const [key,label] of [["employee_name","근로자 이름"],["employee_id","사번"],["employer_name","사업장 이름"]]){
+      if(new Set(identities.map(value=>normalizedIdentity(value[key])).filter(Boolean)).size>1){identityConflict=true;messages.push(label+"이 서로 다릅니다. ‘같은 근로자·사업장의 자료인가요?’에서 원문에 맞게 수정해 주세요.");}
+    }
+    if(!pendingDraft&&current.compatibility?.blocked){
+      const issues=(current.compatibility.issues||[]).filter(issue=>(issue.blocking||issue.severity==="blocking")&&(!identityConflict||issue.code!=="SUBJECT_MISMATCH"));
+      for(const issue of issues)if(issue.message)messages.push(issue.message);
+      if(!identityConflict&&!issues.some(issue=>issue.message))messages.push("문서의 대상 정보나 기간이 맞지 않습니다. 원문과 비교 조건을 확인해 주세요.");
+    }
+  }
+  if(comparisonTimeBasisMissing())messages.push("입력한 시간의 기준을 선택해 주세요. 확인하기 어려운 시간은 빈값으로 보류할 수 있습니다.");
+  return [...new Set(messages)];
+}
+function renderComparisonActionState(blockers) {
+  for(const suffix of ["","-top"]){
+    $("comparison-actions"+suffix).hidden=!isComparison();
+    const button=$("confirm-compare"+suffix),status=$("comparison-action-status"+suffix);
+    button.hidden=!isComparison();button.disabled=!isComparison()||blockers.length>0;
+    status.replaceChildren();
+    if(blockers.length){status.append(node("strong","비교 전 확인할 내용"));const list=node("ul");for(const message of blockers)list.append(node("li",message));status.append(list);}
+    else status.append(node("p","원문과 입력값을 확인했다면 비교할 수 있습니다. 빈 항목은 정보 부족으로 표시됩니다."));
+  }
+}
 function updateComparisonCompatibility() {
   if(!isComparison())return;
   const editedIdentity=readResolvedSourceIdentity(),messages=comparisonSelectionWarnings((current.materials?.sources||[]).map(source=>({...((comparisonSources||[]).find(item=>item.case_id===source.case_id)||{}),...source,identity:editedIdentity[source.case_id]||source.identity})));
@@ -130,7 +166,7 @@ function updateComparisonCompatibility() {
 }
 function comparisonTimeBasisMissing() {return isComparison()&&Boolean($("manual-worked_minutes").value&&!$("worked-time-kind").value||$("manual-slip_minutes").value&&!$("slip-time-kind").value);}
 async function confirmAndCompare() {
-  if(!isComparison()||comparisonSubmitting||loadingMaterials)return;
+  if(!isComparison()||comparisonSubmitting||loadingMaterials||$("confirm-compare").disabled)return;
   comparisonSubmitting=true;updateControls();
   try{await flushDraft();current=comparisonCase=await api(caseApiPath()+"/confirm","POST",{});renderCase();await start("analyze");}
   finally{comparisonSubmitting=false;updateControls();}
@@ -150,9 +186,10 @@ async function initializeComparisons() {
   $("comparison-list").addEventListener("change",safeAction(event=>openComparison(event.target.value)));
   $("new-comparison").addEventListener("click",safeAction(()=>openComparison(null)));
   $("comparison-apply").addEventListener("click",safeAction(applyComparisonSelection));
-  $("confirm-compare").addEventListener("click",safeAction(confirmAndCompare));
+  for(const id of ["confirm-compare","confirm-compare-top"])$(id).addEventListener("click",safeAction(confirmAndCompare));
   $("close-comparison-source").addEventListener("click",closeComparisonSource);
   for(const id of ["worked-time-kind","slip-time-kind","same-subject-confirmed"])$(id).addEventListener("change",()=>{changed();});
-  if(activeRoute==="compare"){comparisonMode=true;await Promise.all([loadComparisons(),loadComparisonSources()]);const saved=new URLSearchParams(location.search).get("comparison")||localStorage.getItem("agent-last-comparison");if(saved&&comparisonRecords.some(record=>record.id===saved))await openComparison(saved);else await openComparison(null);return true;}
+  if(payrollRoute(activeRoute)&&new URLSearchParams(location.search).get("case")&&!new URLSearchParams(location.search).get("comparison"))return false;
+  if(payrollRoute(activeRoute)){comparisonMode=true;await Promise.all([loadComparisons(),loadComparisonSources()]);const saved=new URLSearchParams(location.search).get("comparison")||localStorage.getItem("agent-last-comparison");if(saved&&comparisonRecords.some(record=>record.id===saved))await openComparison(saved);else if(saved){current=comparisonCase=null;renderResults();notice("주소의 급여 건을 찾을 수 없습니다. 다른 급여 건으로 자동 이동하지 않았습니다.",true);renderRoute();}else await openComparison(null);return true;}
   return false;
 }

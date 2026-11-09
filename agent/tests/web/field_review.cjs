@@ -35,6 +35,7 @@ let source=fs.readFileSync(path.join(__dirname,"../../dev/web/app.js"),"utf8");
 source=source.replace(/initialize\(\)\.catch\(error=>\{[^\n]+\}\);\s*$/, "globalThis.uiInitialized=initialize();");
 vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/results.js"),"utf8"),context);
 vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/compare.js"),"utf8"),context);
+vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/pages.js"),"utf8"),context);
 vm.runInContext(source,context);
 const run=code=>vm.runInContext(code,context);
 (async()=>{

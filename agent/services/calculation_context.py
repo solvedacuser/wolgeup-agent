@@ -93,6 +93,22 @@ def build_calculation_context(snapshot: InputSnapshot, owner_id: str, case_id: s
                 src = sources[evidence[ref].source_id]
                 if src.usage == "context":
                     raise IntegrityError("Context-only source cannot supply payroll scalar")
+    if snapshot.wage_conditions is not None:
+        wage = snapshot.wage_conditions
+        conditions = [value for value in wage.__dict__.values() if hasattr(value, "state")]
+        for item in [*conditions, *wage.days, *wage.included_allowances, *wage.statement_mappings]:
+            refs = item.evidence_refs
+            if any(ref not in evidence for ref in refs):
+                raise IntegrityError("Unknown wage evidence ID")
+            confirmed = getattr(item, "state", None) == "known" or getattr(item, "confirmed", False)
+            if confirmed and not refs:
+                raise IntegrityError("Confirmed wage input requires evidence")
+            if (
+                item in conditions
+                and confirmed
+                and any(sources[evidence[ref].source_id].usage == "context" for ref in refs)
+            ):
+                raise IntegrityError("Context-only source cannot supply payroll wage condition")
     dependencies = [f"source:{s.source_id}:{s.document_version}:{s.link_version}" for s in sources.values()]
     dependencies += [f"required-period:{p.start}:{p.end}" for p in snapshot.context_requirements]
     intervals, issues = [], []

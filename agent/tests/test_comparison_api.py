@@ -10,9 +10,8 @@ import zipfile
 import pytest
 
 from agent.config import AgentSettings
-from agent.dev.local_workflow import ComparisonInputError, LocalStore, extraction_draft
+from agent.dev.local_workflow import ComparisonInputError, LocalPorts, LocalStore, extraction_draft
 from agent.dev.test_server import LocalHTTPServer
-from agent.tests.fixture_provider import FixtureProvider
 from agent.tests.support.comparison_documents import (
     NoModelCalls,
     analyzed,
@@ -23,19 +22,18 @@ from agent.tests.support.comparison_documents import (
 )
 
 
-class BlockingExplanation(FixtureProvider):
-    def __init__(self):
-        self.entered, self.release = asyncio.Event(), asyncio.Event()
+async def test_independent_comparison_cancel_resume_report_and_source_invalidation(tmp_path, monkeypatch):
+    provider = NoModelCalls()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_progress = LocalPorts.emit_progress
 
-    async def invoke(self, operation, data):
-        assert operation == "explain"
-        self.entered.set()
-        await self.release.wait()
-        return await super().invoke(operation, data)
+    async def pause_template(ports, context, event):
+        await original_progress(ports, context, event)
+        if context.task_kind == "explain_result" and event.node_id == "compose" and event.status == "running":
+            entered.set()
+            await release.wait()
 
-
-async def test_independent_comparison_cancel_resume_report_and_source_invalidation(tmp_path):
-    provider = BlockingExplanation()
+    monkeypatch.setattr(LocalPorts, "emit_progress", pause_template)
     store = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
     cases = await seed_documents(store)
     before = copy.deepcopy(store.cases)
@@ -50,10 +48,10 @@ async def test_independent_comparison_cancel_resume_report_and_source_invalidati
     }
     assert current["document_id"] is None
     job = await store.create_job(cid, "explain")
-    await asyncio.wait_for(provider.entered.wait(), 5)
+    await asyncio.wait_for(entered.wait(), 5)
     await store.cancel_job(job["id"])
     restored = LocalStore(AgentSettings(), state=tmp_path, provider=provider)
-    provider.release.set()
+    release.set()
     await restored.resume_job(job["id"])
     await restored.tasks[job["id"]]
     assert restored.jobs[job["id"]]["status"] == "completed"
@@ -69,8 +67,7 @@ async def test_independent_comparison_cancel_resume_report_and_source_invalidati
     assert restored.cases == before
     restored.cases[cases["payslip"]]["extraction_revision"] += 1
     restored.save_case(restored.cases[cases["payslip"]])
-    with pytest.raises(KeyError):
-        await restored.artifact(artifact["artifact_id"])
+    assert (await restored.artifact(artifact["artifact_id"]))[0] == data
     assert (await restored.get_comparison(cid))["materials_invalid"] is True
     with pytest.raises(ValueError):
         await restored.create_job(cid, "analyze")

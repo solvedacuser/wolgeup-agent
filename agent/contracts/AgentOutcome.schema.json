@@ -242,6 +242,13 @@
           },
           "title": "Evidence Refs",
           "type": "array"
+        },
+        "wage_items": {
+          "items": {
+            "$ref": "#/$defs/WageComparisonItem"
+          },
+          "title": "Wage Items",
+          "type": "array"
         }
       },
       "required": [
@@ -585,6 +592,27 @@
       "title": "ExtractionCandidate",
       "type": "object"
     },
+    "Period": {
+      "additionalProperties": false,
+      "properties": {
+        "start": {
+          "format": "date",
+          "title": "Start",
+          "type": "string"
+        },
+        "end": {
+          "format": "date",
+          "title": "End",
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "title": "Period",
+      "type": "object"
+    },
     "Question": {
       "additionalProperties": false,
       "properties": {
@@ -619,6 +647,25 @@
             "type": "string"
           },
           "title": "Required Materials",
+          "type": "array"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "required_periods": {
+          "items": {
+            "$ref": "#/$defs/Period"
+          },
+          "title": "Required Periods",
+          "type": "array"
+        },
+        "glossary_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Glossary Ids",
           "type": "array"
         }
       },
@@ -670,6 +717,100 @@
         "included_source_ids"
       ],
       "title": "ReportCandidate",
+      "type": "object"
+    },
+    "WageComparisonItem": {
+      "additionalProperties": false,
+      "properties": {
+        "rule_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Rule Ids",
+          "type": "array"
+        },
+        "statement_item_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Statement Item Ids",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "match",
+            "difference",
+            "insufficient",
+            "needs_review"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "lhs": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lhs"
+        },
+        "rhs": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rhs"
+        },
+        "delta": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Delta"
+        },
+        "reason_codes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reason Codes",
+          "type": "array"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        },
+        "independent": {
+          "default": true,
+          "title": "Independent",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "rule_ids",
+        "statement_item_ids",
+        "status"
+      ],
+      "title": "WageComparisonItem",
       "type": "object"
     },
     "WageItemResult": {
@@ -746,6 +887,73 @@
           },
           "title": "Operands",
           "type": "object"
+        },
+        "included_amount": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Included Amount"
+        },
+        "additional_amount": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Additional Amount"
+        },
+        "payable_amount": {
+          "anyOf": [
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payable Amount"
+        },
+        "required_field_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Required Field Ids",
+          "type": "array"
+        },
+        "required_periods": {
+          "items": {
+            "$ref": "#/$defs/Period"
+          },
+          "title": "Required Periods",
+          "type": "array"
+        },
+        "official_sources": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Official Sources",
+          "type": "array"
+        },
+        "dependencies": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Dependencies",
+          "type": "array"
         }
       },
       "required": [

@@ -158,7 +158,7 @@ def confirmed_result(candidate):
 def explanation_task(result, *, job_id=None):
     return AgentTask(
         context=context("explain_result", job_id=job_id),
-        payload=ExplanationInput(result=result, allowed_facts=allowed_facts(result)),
+        payload=ExplanationInput(result=result, allowed_facts=allowed_facts(result), generation_mode="model"),
     )
 
 

@@ -3,7 +3,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-ENGINE_VERSION = "agent-0.3.0"
+ENGINE_VERSION = "agent-0.4.0"
+# Extraction compatibility is deliberately independent of wage/report changes.
+EXTRACTION_COMPATIBILITY_VERSION = "extraction-1.2"
 SCHEMA_VERSION = "1.0"
 CHECKPOINT_VERSION = "1.0"
 

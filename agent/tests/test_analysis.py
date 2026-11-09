@@ -31,7 +31,7 @@ async def test_analysis_graph_eight_nodes_and_single_join(setup_agent):
     assert [r.status for r in outcome.payload.comparisons[:6]] == ["match"] * 6
     assert all(r.status == "needs_review" for r in outcome.payload.wage_section.items)
     assert outcome.payload.wage_section.gross_total is None
-    assert outcome.payload.comparisons[6].status == "needs_review"
+    assert outcome.payload.comparisons[6].status == "insufficient"
     assert not outcome.payload.wage_section.scope_complete
     assert len(ports.checkpoints[task.context.job_id].completed_nodes) == 8
     assert len([event for event in ports.events if event["node_id"] == "aggregate"]) == 1
@@ -244,7 +244,7 @@ async def test_detailed_work_summary_conflict_holds_only_time_comparison(setup_a
     assert all(out.payload.comparisons[index].status == "match" for index in (0, 2, 3, 4, 5))
     question = next(item for item in out.payload.questions if item.reason_code == "WORK_SUMMARY_MISMATCH")
     assert question.blocking_rule_ids == ["R-02"]
-    assert "상세 실근로시간 합계" in question.text
+    assert "상세 실근로시간 합계" in question.reason
 
 
 def test_detail_totals_clip_payroll_boundaries_and_cross_midnight_breaks(setup_agent):

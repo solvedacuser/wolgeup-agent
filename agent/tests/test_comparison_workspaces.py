@@ -36,7 +36,7 @@ async def test_three_documents_are_a_comparison_not_a_document_and_match_author_
     current, results = await analyzed(store, cid)
     expected = author_gold()["expected"]["without_contract"]
     assert {key: results[key]["status"] for key in expected} == expected
-    assert results["R-07"]["status"] == "needs_review"
+    assert results["R-07"]["status"] == "insufficient"
     assert results["R-02"]["lhs"] == results["R-02"]["rhs"] == "9600"
     assert results["R-06"]["lhs"] == results["R-06"]["rhs"] == "2888000"
     assert current["analysis_period"] == author_gold()["period"]

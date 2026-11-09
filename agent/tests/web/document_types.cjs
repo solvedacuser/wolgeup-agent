@@ -32,6 +32,7 @@ source=source.replace(/initialize\(\)\.catch\(error=>\{[^\n]+\}\);\s*$/, "global
 assert.ok(source.includes("globalThis.uiInitialized"));
 vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/results.js"),"utf8"),context);
 vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/compare.js"),"utf8"),context);
+vm.runInContext(fs.readFileSync(path.join(__dirname,"../../dev/web/pages.js"),"utf8"),context);
 vm.runInContext(source,context);
 (async()=>{
   await context.uiInitialized;
@@ -64,7 +65,7 @@ vm.runInContext(source,context);
   assert.equal(requests.filter(request=>request.method==="POST").length,0);
   await vm.runInContext("start('ocr')",context);
   assert.equal(requests.at(-1).body.stage,"ocr");assert.equal(get("ocr-job-status").hidden,false);
-  assert.ok(get("ocr-job-status").textContent.includes("0"));
+  assert.ok(get("ocr-job-status").textContent.includes("원문 읽기"));
   vm.runInContext("currentJob=null;current.ocr={pages:['real OCR source']}",context);
   await vm.runInContext("navigateRoute('ai')",context);
   assert.equal(requests.filter(request=>request.method==="POST").length,1,"The AI page only navigates after OCR.");

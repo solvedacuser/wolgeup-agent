@@ -249,6 +249,7 @@ def build_materials(store, selection: dict) -> dict:
         "earnings": [],
         "deductions": [],
         "transactions": [],
+        "work_rows": [],
         "evidence_catalog": [],
         "field_evidence": {},
         "field_validation": {},
@@ -401,6 +402,21 @@ def build_materials(store, selection: dict) -> dict:
                 if value is not None:
                     result["suggested"]["manual"]["worked_minutes"] = _number(value, integral=True)
             result["field_evidence"].setdefault("worked_minutes", []).extend(_refs(fields, "worked_minutes"))
+            for index, row in _rows(fields, "work"):
+                result["work_rows"].append(
+                    {
+                        "record_id": "work-" + digest([file_hash, index]),
+                        **{
+                            key: _value(row, key)
+                            for key in ("date", "start", "end", "break_interval", "break_minutes", "note")
+                        },
+                        "evidence_refs": _refs(row, *row),
+                        "source_case_id": case_id,
+                        "validation_warnings": row_warnings(
+                            row, required=("date", "start", "end"), row_prefix=f"work_{index}"
+                        ),
+                    }
+                )
         elif kind == "deposit":
             account = _value(fields, "account_number")
             for index, row in _rows(fields, "transaction"):

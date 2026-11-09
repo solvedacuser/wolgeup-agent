@@ -125,7 +125,7 @@ async def test_partial_manual_row_draft_can_save_but_requires_a_label_to_confirm
         await store.save_draft(live["id"], draft)
 
 
-async def test_legacy_extraction_requires_new_validation_without_losing_user_input(tmp_path):
+async def test_extraction_compatibility_is_independent_of_engine_without_losing_user_input(tmp_path):
     from agent.dev.local_workflow import ComparisonInputError
 
     corpus = tmp_path / "corpus"
@@ -138,6 +138,12 @@ async def test_legacy_extraction_requires_new_validation_without_losing_user_inp
     live["draft"].update(period_start="2026-10-01", period_end="2026-10-31")
     live.pop("extraction_engine_version")
     store.save_case(live)
+    restored = LocalStore(AgentSettings(), corpus=corpus)
+    assert not (await restored.get_case(live["id"]))["extraction_needs_review"]
+    assert (await restored.list_comparison_sources())[0]["has_extraction"]
+    await restored.confirm(live["id"])
+    restored.cases[live["id"]]["extraction_compatibility_version"] = "unsupported-extraction"
+    restored.save_case(restored.cases[live["id"]])
     restored = LocalStore(AgentSettings(), corpus=corpus)
     assert (await restored.get_case(live["id"]))["extraction_needs_review"]
     assert not (await restored.list_comparison_sources())[0]["has_extraction"]

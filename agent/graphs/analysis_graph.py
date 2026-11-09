@@ -1,4 +1,3 @@
-from decimal import Decimal
 from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -6,12 +5,13 @@ from langgraph.graph import END, START, StateGraph
 from agent.config import ENGINE_VERSION
 from agent.rules import comparisons
 from agent.rules.registry import WAGE_RULE_IDS
+from agent.rules.wages import compare_wages, wage_section
 from agent.schemas.internal.calculation_context import CalculationContext
 from agent.schemas.public.errors import IntegrityError
-from agent.schemas.public.results import AnalysisResultCandidate, Question, WageSection
+from agent.schemas.public.results import AnalysisResultCandidate, WageSection
 from agent.services.calculation_context import build_calculation_context
 from agent.services.hashing import digest, result_hash
-from agent.services.messages import RULE_FIELDS, reason_text
+from agent.services.questions import build_questions
 
 
 class AnalysisState(TypedDict, total=False):
@@ -50,13 +50,7 @@ def build_analysis_graph(runtime, registry):
         def compute():
             ctx = CalculationContext.model_validate(state["context"])
             items = [registry.evaluate(rid, ctx) for rid in WAGE_RULE_IDS]
-            # No full-scope coverage assertion exists yet: never manufacture a gross total.
-            return WageSection(
-                items=items,
-                subtotal=sum((x.amount or Decimal(0) for x in items), Decimal(0)),
-                gross_total=None,
-                scope_complete=False,
-            ).model_dump(mode="json")
+            return wage_section(items, ctx.snapshot).model_dump(mode="json")
 
         return {"wage": await runtime.step("worker_wage", compute)}
 
@@ -79,9 +73,7 @@ def build_analysis_graph(runtime, registry):
             ctx = CalculationContext.model_validate(state["context"])
             comps = state["terms"] + state["statement"] + state["payment"]
             comps.append(
-                comparisons.comparison(
-                    "R-07", reasons=["WAGE_MAPPING_OR_RULE_UNVERIFIED"], conflict=True
-                ).model_dump(mode="json")
+                compare_wages(ctx, WageSection.model_validate(state["wage"])).model_dump(mode="json")
             )
             return AnalysisResultCandidate(
                 owner_id=ctx.snapshot.owner_id,
@@ -114,6 +106,13 @@ def build_analysis_graph(runtime, registry):
             expected_items = [registry.evaluate(rid, ctx) for rid in WAGE_RULE_IDS]
             if digest(candidate.wage_section.items) != digest(expected_items):
                 raise IntegrityError("Wage revalidation failed")
+            expected_wage = wage_section(expected_items, ctx.snapshot)
+            if digest(candidate.wage_section) != digest(expected_wage):
+                raise IntegrityError("Wage total revalidation failed")
+            if len(candidate.comparisons) != 7 or digest(candidate.comparisons[6]) != digest(
+                compare_wages(ctx, expected_wage)
+            ):
+                raise IntegrityError("Wage comparison revalidation failed")
             allowed = {e.evidence_id for e in ctx.snapshot.evidence_catalog}
             for item in [*candidate.comparisons, *candidate.wage_section.items]:
                 if not set(item.evidence_refs) <= allowed:
@@ -129,20 +128,9 @@ def build_analysis_graph(runtime, registry):
             if not state["validated"]:
                 raise IntegrityError("Unvalidated result")
             result = AnalysisResultCandidate.model_validate(state["candidate"])
-            groups = {}
-            for item in [*result.comparisons, *result.wage_section.items]:
-                for reason in item.reason_codes:
-                    groups.setdefault(reason, set()).add(item.rule_id)
-            result.questions = [
-                Question(
-                    question_id=digest([reason, sorted(ids)]),
-                    reason_code=reason,
-                    target_field_ids=sorted({field for rid in ids for field in RULE_FIELDS.get(rid, [])}),
-                    blocking_rule_ids=sorted(ids),
-                    text=reason_text(reason),
-                )
-                for reason, ids in sorted(groups.items())
-            ]
+            result.questions = build_questions(
+                result.wage_section.items, result.comparisons, snapshot=payload.snapshot
+            )
             result.result_hash = result_hash(result)
             return result.model_dump(mode="json")
 

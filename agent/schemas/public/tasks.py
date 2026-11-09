@@ -1,9 +1,9 @@
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from agent.config import ENGINE_VERSION
-from agent.schemas.public.base import AwareDateTime, ContractModel
+from agent.schemas.public.base import AwareDateTime, ContractModel, Period
 from agent.schemas.public.inputs import InputSnapshot, SourceRef
 from agent.schemas.public.results import (
     AnalysisResult,
@@ -72,6 +72,43 @@ class ExplanationInput(ContractModel):
     allowed_facts: dict[str, str]
     prompt_version: str = "explain-v1"
     model_config_version: str = "luna-v1"
+    generation_mode: Literal["template", "model"] = "template"
+
+
+class ReportCondition(ContractModel):
+    model_config = ConfigDict(frozen=True)
+
+    label: str
+    value: str
+    state: Literal["known", "missing", "unknown", "pending", "conflict"] = "known"
+    evidence_refs: tuple[str, ...] = ()
+
+
+class ReportSource(ContractModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_id: str
+    filename: str
+
+
+class ReportPeriod(Period):
+    model_config = ConfigDict(frozen=True)
+
+
+class ReportDisplayContext(ContractModel):
+    model_config = ConfigDict(frozen=True)
+
+    snapshot_id: str
+    snapshot_hash: str
+    workplace_name: str
+    period: ReportPeriod
+    conditions: tuple[ReportCondition, ...] = ()
+    sources: tuple[ReportSource, ...] = ()
+
+    @field_validator("period", mode="before")
+    @classmethod
+    def copy_period(cls, value):
+        return value.model_dump() if isinstance(value, Period) else value
 
 
 class ReportInput(ContractModel):
@@ -81,6 +118,7 @@ class ReportInput(ContractModel):
     selected_sources: list[SourceRef] = Field(default_factory=list)
     generated_at: AwareDateTime
     template_version: str = "report-v1"
+    display_context: ReportDisplayContext | None = None
 
 
 Payload = ExtractionInput | AnalysisJobInput | ExplanationInput | ReportInput

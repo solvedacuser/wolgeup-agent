@@ -19,6 +19,8 @@ REASONS = {
     "INVALID_ALLOCATION": "입금액을 넘거나 음수인 배분액을 수정해 주세요.",
     "CONDITION_CONFLICT": "계산에 필요한 근로조건이 서로 달라 확인이 필요합니다.",
     "REQUIRED_INPUT_MISSING": "계산에 필요한 조건이나 기간 전후 자료를 확인해 주세요.",
+    "WAGE_COMPONENT_DIFFERENCE": "총액 차이는 0원이지만 세부 항목의 차이가 서로 상쇄되어 있습니다. 항목별 금액을 확인해 주세요.",
+    "HOLIDAY_BOUNDARY_REVIEW": "자정을 넘는 근무 중 휴일의 구분이 달라져 원문 기록과 적용 기준을 확인해야 합니다.",
 }
 
 RULE_FIELDS = {

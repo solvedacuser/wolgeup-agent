@@ -6,7 +6,7 @@ from langgraph.graph import END, START, StateGraph
 from agent.providers.base import ExplanationResponse
 from agent.schemas.public.errors import BudgetExceeded, IntegrityError, ModelFormatError, ModelUnavailable
 from agent.schemas.public.results import ExplanationCandidate
-from agent.services.facts import allowed_facts, allowed_templates
+from agent.services.facts import allowed_facts, allowed_templates, template_explanation
 
 
 def guard_response(response, facts, question_ids):
@@ -48,6 +48,11 @@ def build_explanation_graph(runtime):
 
     async def compose(state):
         async def generate():
+            if payload.generation_mode == "template":
+                return {
+                    "response": {"templates": allowed_templates(facts)[1:], "question_ids": qids},
+                    "status": "template_fallback",
+                }
             try:
                 response = await runtime.call_model(
                     "compose",
@@ -75,6 +80,8 @@ def build_explanation_graph(runtime):
         def finish():
             if not state["checked"]:
                 raise IntegrityError("Unvalidated explanation")
+            if payload.generation_mode == "template":
+                return template_explanation(payload.result).model_dump(mode="json")
             response = state["composed"]["response"]
             paragraphs = [
                 re.sub(r"\{\{([a-zA-Z0-9_]+)\}\}", lambda m: facts[m.group(1)], text)

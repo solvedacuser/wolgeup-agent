@@ -2,8 +2,20 @@ from typing import Literal
 
 from pydantic import Field
 
-from agent.schemas.public.base import AwareDateTime, ContractModel, Money
+from agent.schemas.public.base import AwareDateTime, ContractModel, Money, Period
 from agent.schemas.public.inputs import EvidenceRef
+
+
+class WageComparisonItem(ContractModel):
+    rule_ids: list[str]
+    statement_item_ids: list[str]
+    status: Literal["match", "difference", "insufficient", "needs_review"]
+    lhs: Money | None = None
+    rhs: Money | None = None
+    delta: Money | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    independent: bool = True
 
 
 class ComparisonResult(ContractModel):
@@ -17,6 +29,7 @@ class ComparisonResult(ContractModel):
     scope_complete: bool = False
     reason_codes: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
+    wage_items: list[WageComparisonItem] = Field(default_factory=list)
 
 
 class WageItemResult(ContractModel):
@@ -28,6 +41,13 @@ class WageItemResult(ContractModel):
     reason_codes: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     operands: dict[str, str] = Field(default_factory=dict)
+    included_amount: Money | None = None
+    additional_amount: Money | None = None
+    payable_amount: Money | None = None
+    required_field_ids: list[str] = Field(default_factory=list)
+    required_periods: list[Period] = Field(default_factory=list)
+    official_sources: list[str] = Field(default_factory=list)
+    dependencies: list[str] = Field(default_factory=list)
 
 
 class WageSection(ContractModel):
@@ -44,6 +64,9 @@ class Question(ContractModel):
     blocking_rule_ids: list[str]
     text: str
     required_materials: list[str] = Field(default_factory=list)
+    reason: str = ""
+    required_periods: list[Period] = Field(default_factory=list)
+    glossary_ids: list[str] = Field(default_factory=list)
 
 
 class AnalysisResultCandidate(ContractModel):

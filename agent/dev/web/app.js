@@ -5,6 +5,7 @@ const manualLabels = {slip_rate:"명세서 단가 (선택 단위)",worked_minute
 const statuses = {match:"일치",difference:"차이 발견",insufficient:"정보 부족",needs_review:"검토 필요"};
 const ruleLabels = {"R-01":"계약 단가 ↔ 명세서 단가","R-02":"근태 시간 ↔ 명세서 시간","R-03":"지급 항목 ↔ 총지급액","R-04":"공제 항목 ↔ 총공제액","R-05":"계산 실수령액 ↔ 명세서","R-06":"명세서 실수령액 ↔ 입금액","R-07":"법정 임금 규칙 검토"};
 const comparisonSides = {"R-01":["명세서 단가","계약서 단가"],"R-02":["명세서 시간","근무기록 시간"],"R-03":["확인한 지급 항목 합계","명세서 총지급액"],"R-04":["확인한 공제 항목 합계","명세서 총공제액"],"R-05":["총지급액 − 총공제액","명세서 실수령액"],"R-06":["명세서 실수령액","선택·배분한 입금액"]};
+comparisonSides["R-07"]=["계산한 임금","같은 항목의 명세서 금액"];
 const stageLabels = {ocr:"원문 읽기",extract:"AI 항목 정리",supplement:"PDF 보완 읽기",analyze:"대조",explain:"설명",report:"보고서"};
 const sourceConversions = new Set(["SOURCE_UNIT_FROM_HEADER","SOURCE_TEXT_SEPARATOR_NORMALIZED","SOURCE_SCALAR_SPELLING_RESTORED"]);
 function reviewIssues(field) { return (field.issues||[]).filter(issue=>!sourceConversions.has(issue)); }
@@ -65,7 +66,18 @@ function fieldReviewLabel(field) {
 }
 let docs = [], profiles = {}, current = null, currentJob = null, pollTimer, draftTimer, pendingDraft = false, changingType = false, saveChain = Promise.resolve();
 let supplementSelection=new Set(),supplementSelectionKey="",candidateRequestPending=false;
-const routeInfo = {ocr:{title:"원문부터 읽으세요",description:"PDF의 텍스트를 먼저 읽고, 스캔된 페이지는 OCR로 읽어 저장합니다.",eyebrow:"STEP 01 · READ",step:1},ai:{title:"AI로 문서와 항목을 분류하세요",description:"저장한 원문으로 항목을 정리하고, 필요한 항목만 PDF로 보완해 읽습니다.",eyebrow:"STEP 02 · AI",step:2},compare:{title:"문서의 값을 연결하고 대조하세요",description:"AI 처리한 자료를 선택하고 입력값을 확인한 뒤 문서 간 차이를 비교합니다.",eyebrow:"STEP 03 · COMPARE",step:3}};
+const routeInfo = {
+ocr:{title:"문서 등록·읽기",description:"PDF의 텍스트를 먼저 읽고, 스캔된 페이지는 OCR로 읽습니다.",eyebrow:"문서 준비",step:1},
+ai:{title:"AI 정리",description:"저장한 원문으로 항목을 정리하고, 필요한 항목만 PDF로 보완합니다.",eyebrow:"문서 준비",step:2},
+compare:{title:"계산·대조",description:"이번 급여에 사용할 자료와 조건을 확인하세요.",eyebrow:"급여 확인",step:3},
+results:{title:"결과",description:"계산된 범위와 자료의 차이를 근거와 함께 확인하세요.",eyebrow:"급여 확인",step:4},
+questions:{title:"확인 질문",description:"부족한 정보와 필요한 날짜를 확인하고 입력을 보완하세요.",eyebrow:"급여 확인",step:5},
+inquiry:{title:"회사 문의",description:"확인된 내용으로 문의 초안을 만들고 직접 수정하세요.",eyebrow:"급여 확인",step:6},
+reports:{title:"자료 받기",description:"보고서와 선택한 원본을 같은 결과 버전으로 받으세요.",eyebrow:"급여 확인",step:7},
+glossary:{title:"쉬운 용어",description:"급여 문서에 나오는 말을 쉬운 설명과 예시로 알아보세요.",eyebrow:"이용 도움",step:8}};
+function payrollRoute(route) {return ["compare","results","questions","inquiry","reports"].includes(route);}
+let routeResultId=new URLSearchParams(location.search).get("result")||"";
+let routeComparisonId=new URLSearchParams(location.search).get("comparison")||"";
 let activeRoute = Object.hasOwn(routeInfo,location.pathname.split("/")[1])?location.pathname.split("/")[1]:"ocr";
 let comparisonSources = null, comparisonSourcesRequest = null, loadingMaterials = false;
 let materialSelectors = {}, materialInputs = {earnings:new Map(),deductions:new Map(),transactions:new Map(),row_roles:new Map(),manual_rows:new Map()};
@@ -83,7 +95,14 @@ async function api(path, method="GET", body) {
 function safeAction(fn) { return async event => { try { await fn(event); } catch(error) { notice(error.message,true); } }; }
 function busy() { return currentJob && ["queued","running"].includes(currentJob.status); }
 function docForCase() { return docs.find(d=>d.id===current?.document_id); }
-function routeUrl(route) { const record=route==="compare"?comparisonCase:(isComparison()?documentCase:current);return "/"+route+(record?(route==="compare"?"?comparison=":"?case=")+encodeURIComponent(record.id):""); }
+function routeUrl(route) {
+  const params=new URLSearchParams(),comparison=comparisonCase||(isComparison()?current:null),doc=documentCase||(!isComparison()?current:null);
+  if(doc&&(!payrollRoute(route)||!comparison&&!routeComparisonId))params.set("case",doc.id);
+  if(comparison)params.set("comparison",comparison.id);else if(routeComparisonId)params.set("comparison",routeComparisonId);
+  if(routeResultId)params.set("result",routeResultId);
+  if(route==="glossary"){const currentParams=new URLSearchParams(location.search),back=activeRoute==="glossary"?currentParams.get("return"):routeUrl(activeRoute)+(location.hash||"");if(back)params.set("return",back);if(activeRoute==="glossary"&&currentParams.get("term"))params.set("term",currentParams.get("term"));}
+  return "/"+route+(params.toString()?"?"+params.toString():"");
+}
 function rememberCase() { if(isComparison())return rememberComparison();documentCase=current;localStorage.setItem("agent-last-case",current.id);localStorage.setItem("agent-case-"+current.document_id,current.id);history.replaceState(null,"",routeUrl(activeRoute));updateRouteLinks(); }
 function number(value) { return value===null||value===undefined||String(value).trim()===""?"미확인":Number.isFinite(Number(value))?Number(value).toLocaleString("ko-KR"):String(value); }
 function buildFields() {
@@ -97,7 +116,7 @@ function buildFields() {
   for(const [key,label] of Object.entries(manualLabels)) {
     const wrap=node("label",label,"field"); wrap.htmlFor="manual-"+key;
     const input=node("input"); input.id="manual-"+key; input.placeholder="미확인"; input.inputMode="decimal";input.setAttribute("aria-label",label);
-    wrap.append(input); const meta=node("div",undefined,"field-meta");meta.id="manual-meta-"+key;wrap.append(meta);$("manual-fields").append(wrap);
+    wrap.append(input);if(typeof glossaryLink==="function"&&["deduction","net","gross","worked_minutes","slip_minutes","deposit_total"].includes(key))wrap.append(glossaryLink(({worked_minutes:"worked_hours",slip_minutes:"paid_hours",deposit_total:"payment_allocation"})[key]||key,"쉬운 설명")); const meta=node("div",undefined,"field-meta");meta.id="manual-meta-"+key;wrap.append(meta);$("manual-fields").append(wrap);
   }
 }
 async function loadDocuments() { docs=(await api("/api/documents")).documents.filter(doc=>doc.kind==="upload"); $("document-count").textContent=docs.length; renderDocuments(); }
@@ -114,11 +133,15 @@ function renderDocuments() {
 }
 async function selectDocument(docId) {
   if(candidateRequestPending)return;
-  if(activeRoute==="compare")await navigateRoute("ai");
+  if(payrollRoute(activeRoute))await navigateRoute("ai");
   await flushDraft(); clearTimeout(pollTimer); currentJob=null;
-  const stored=localStorage.getItem("agent-case-"+docId);
-  if(stored) { try { current=await api("/api/cases/"+stored); } catch { current=null; } }
-  else current=null;
+  const stored=localStorage.getItem("agent-case-"+docId),existing=docs.find(doc=>doc.id===docId)?.case_id;
+  current=null;
+  for(const id of new Set([stored,existing].filter(Boolean))){
+    try{const restored=await api("/api/cases/"+encodeURIComponent(id));if(restored.document_id===docId){current=restored;break;}if(id===stored)localStorage.removeItem("agent-case-"+docId);}
+    catch{if(id===stored)localStorage.removeItem("agent-case-"+docId);}
+  }
+  if(!current&&existing)throw new Error("기존 문서 처리 결과를 불러오지 못했습니다. 문서 목록을 새로고침한 뒤 다시 선택해 주세요.");
   if(!current) current=await api("/api/cases","POST",{document_id:docId,document_type:"auto"});
   rememberCase();
   notice(""); renderCase();
@@ -189,7 +212,7 @@ function renderCase() {
   const issueLabels={PYTHON_OCR_AI_CLASSIFICATION:"Python OCR → AI 분류가 완료되었습니다. 아래 후보를 확인해 주세요.",OCR_REQUIRES_USER_CONFIRMATION:"OCR로 인식한 값은 원본과 대조해 확인해 주세요.",OCR_LOW_CONFIDENCE:"일부 OCR 문자의 인식 신뢰도가 낮습니다. 해당 페이지의 금액·시간·날짜를 원본에서 확인해 주세요.",OCR_RULE_BASED_EXTRACTION:"이전 Python 규칙 분류 결과입니다. 새 OCR·AI 분류로 다시 추출할 수 있습니다.",OCR_LAYOUT_REQUIRES_MANUAL_REVIEW:"자동으로 분류한 항목이 없습니다. OCR 전체 원문을 보고 직접 입력해 주세요."};
   Object.assign(issueLabels,{PDF_TEXT_AI_CLASSIFICATION:"PDF에 저장된 텍스트로 기본 항목을 정리했습니다. 아래 후보를 확인해 주세요.",SOURCE_REQUIRES_USER_CONFIRMATION:"저장 텍스트와 인용문이 같아도 내용이 정확하다는 뜻은 아닙니다. 원본을 직접 확인해 주세요.",PDF_SUPPLEMENT_REQUIRES_USER_CONFIRMATION:"원본 PDF로 보완해 읽은 후보입니다. A·B값을 직접 확인하고 사용할 값을 선택하세요."});
   for(const issue of extraction?.issues||[]) if(issue!=="VISION_REQUIRES_USER_CONFIRMATION") $("extraction-issues").append(node("p",issueLabels[issue]||issue,"issue"));
-  renderExtractionChanges(); renderDraftHistory(); renderMaterials(); renderMaterialReview(); renderComparisonContext(); renderResults(); renderJob();
+  renderExtractionChanges(); renderDraftHistory(); renderMaterials(); renderMaterialReview(); renderComparisonContext(); if(typeof renderWageForm==="function")renderWageForm(); renderResults(); renderJob();
   if(comparisonSources===null&&!comparisonSourcesRequest) loadComparisonSources().catch(error=>notice("자료 목록을 불러오지 못했습니다. "+error.message,true));
 }
 function renderOcrPages(target, pages) {
@@ -252,6 +275,23 @@ function candidateDefinition(fieldId) {const profile=profiles[current?.document_
 function originalCandidate(fieldId) {return candidateBase()?.fields?.find(field=>field.field_id===fieldId);}
 function candidateSource(field,payload) {const evidence=(payload?.evidence_catalog||[]).find(item=>(field?.evidence_refs||[]).includes(item.evidence_id));return {quote:field?.source_quote||evidence?.quote||"",page:field?.source_page||evidence?.page||null};}
 function supplementEligible(field) {const original=originalCandidate(field.field_id);return original&&["needs_review","missing"].includes(fieldValidationStatus(original))&&["needs_review","missing"].includes(fieldValidationStatus(field));}
+function supplementCheckbox(field) {
+  const check=node("input");check.type="checkbox";check.checked=supplementSelection.has(field.field_id);check.disabled=busy()||candidateRequestPending||Boolean(current?.extraction_needs_review);check.dataset.supplementField=field.field_id;
+  check.setAttribute("aria-label",fieldReviewLabel(field)+" 보완 읽기");
+  check.addEventListener("change",()=>{if(check.checked)supplementSelection.add(field.field_id);else supplementSelection.delete(field.field_id);updateSupplementControls();});return check;
+}
+function renderSupplementFields() {
+  const target=$("supplement-fields"),empty=$("supplement-empty");target.replaceChildren();
+  const fields=current?.extraction&&!isComparison()&&!current.extraction_needs_review?current.extraction.fields.filter(supplementEligible):[];
+  const eligible=new Set(fields.map(field=>field.field_id));for(const id of supplementSelection)if(!eligible.has(id))supplementSelection.delete(id);
+  empty.hidden=fields.length>0;empty.textContent=current?.extraction_needs_review?"이전 추출 기준의 결과입니다. 기본 항목 정리를 다시 완료한 뒤 보완할 항목을 선택해 주세요.":current?.extraction?"보완할 미확인 항목이 없습니다. 이미 확인한 값은 아래에서 원문을 보고 직접 수정할 수 있습니다.":"기본 항목 정리를 완료하면 보완할 항목이 표시됩니다.";
+  for(const field of fields){
+    const label=node("label",undefined,"supplement-target"),text=node("span",undefined,"supplement-target-text"),source=candidateSource(originalCandidate(field.field_id),candidateBase());
+    text.append(node("strong",fieldReviewLabel(field)),node("small",validationLabels[fieldValidationStatus(field)]+(source.page?" · "+source.page+"쪽":"")));
+    const raw=field.raw_value==null||field.raw_value===""?"읽은 값 없음":String(field.raw_value);text.append(node("small","기본 읽기: "+(raw.length>160?raw.slice(0,160)+"…":raw)));
+    label.append(supplementCheckbox(field),text);target.append(label);
+  }
+}
 function candidateUsable(field,payload,isSupplement=false) {const source=candidateSource(field,payload),pages=docForCase()?.pages||payload?.page_count||current?.ocr?.pages?.length||0;return Boolean(field&&fieldValidationStatus(field)==="valid"&&field.normalized_value!=null&&(!isSupplement||(source.quote.trim()&&Number.isInteger(source.page)&&source.page>0&&source.page<=pages)));}
 function candidateOriginButton(field,payload,label="원문 보기 ↗") {const source=candidateSource(field,payload),pages=docForCase()?.pages||payload?.page_count||current?.ocr?.pages?.length||0,validPage=Number.isInteger(source.page)&&source.page>0&&source.page<=pages;const button=node("button",label,"evidence-link");button.type="button";button.addEventListener("click",()=>openSourceDocument(current.document_id,docForCase()?.title,validPage?source.page:1));return button;}
 function candidateValue(field) {return field?.normalized_value??field?.suggested_value??field?.raw_value??null;}
@@ -267,7 +307,7 @@ function renderCandidateChoice(field,payload,kind,candidateId,stale=false) {
 }
 function appendCandidateEditor(cell,field) {
   const original=originalCandidate(field.field_id);if(!original||isComparison())return;
-  if(supplementEligible(field)){const label=node("label",undefined,"supplement-field-select"),check=node("input");check.type="checkbox";check.checked=supplementSelection.has(field.field_id);check.disabled=busy()||candidateRequestPending;check.dataset.supplementField=field.field_id;check.addEventListener("change",()=>{if(check.checked)supplementSelection.add(field.field_id);else supplementSelection.delete(field.field_id);updateSupplementControls();});label.append(check,node("span","이 항목 PDF로 보완 읽기"));cell.prepend?cell.prepend(label):cell.append(label);}
+  if(supplementEligible(field)){const label=node("label",undefined,"supplement-field-select");label.append(supplementCheckbox(field),node("span","이 항목 PDF로 보완 읽기"));cell.prepend?cell.prepend(label):cell.append(label);}
   const candidates=(current.supplements||[]).filter(item=>item.payload?.fields?.some(value=>value.field_id===field.field_id)),latest=candidates.at(-1);
   if(latest){const alternative=latest.payload.fields.find(value=>value.field_id===field.field_id),left=candidateValue(original),right=candidateValue(alternative),agreement=left==null||right==null?"한쪽 값 없음":String(left)===String(right)&&original.unit===alternative.unit?"A·B 값 일치":"A·B 값 다름";const comparison=node("section",undefined,"candidate-comparison");comparison.append(node("strong",agreement+" · 원문 확인 필요"),node("p","두 읽기의 값이 같아도 사용자 확인 전 후보입니다.","muted"));const pair=node("div",undefined,"candidate-choice-grid");pair.append(renderCandidateChoice(original,candidateBase(),"A","A"),renderCandidateChoice(alternative,latest.payload,"B",latest.id+":"+field.field_id,latest.base_extraction_revision!==(current.extraction_a_revision??current.extraction_revision)));comparison.append(pair);cell.append(comparison);}
   const definition=candidateDefinition(field.field_id),rate=definition.unit==="rate",details=node("details",undefined,"candidate-manual"),summary=node("summary","원문 보고 직접 수정 · 보류"),label=node("label","직접 확인한 값","field"),input=node("input"),unitLabel=node("label","단위","field"),unit=node(rate?"select":"input");input.setAttribute("aria-label",fieldReviewLabel(original)+" 직접 확인한 값");input.placeholder=original.unit==="date"?"YYYY-MM-DD":original.unit==="minute"?"분 단위 정수":"원문에서 확인한 값";if(rate){for(const [value,text] of [["","단위 선택"],["KRW/hour","원 / 시간"],["KRW/month","원 / 월"],["KRW/year","원 / 년"],["KRW/day","원 / 일"]]){const option=node("option",text);option.value=value;unit.append(option);}}else unit.readOnly=true;unit.value=original.unit||definition.unit||"";unit.setAttribute("aria-label",fieldReviewLabel(original)+" 직접 입력 단위");label.append(input);unitLabel.append(unit);details.append(summary,candidateOriginButton(original,candidateBase()),label,unitLabel,node("p","금액은 쉼표 없는 숫자, 시간은 분 단위로 입력하세요. 날짜는 YYYY-MM-DD 형식입니다.","muted"));
@@ -278,7 +318,7 @@ function extractedValue(field, definition, extraction) {
 }
 function updateSupplementControls() {
   const available=Boolean(current?.extraction&&!isComparison()),running=busy()||candidateRequestPending;$("supplement-panel").hidden=!available;$("supplement-count").textContent=supplementSelection.size+"개 항목 선택 · 한 번에 최대 50개";$("supplement").disabled=!available||running||!supplementSelection.size||supplementSelection.size>50||Boolean(current?.extraction_needs_review);
-  document.querySelectorAll("[data-supplement-field]").forEach(input=>{input.disabled=running;});
+  document.querySelectorAll("[data-supplement-field]").forEach(input=>{input.checked=supplementSelection.has(input.dataset.supplementField);input.disabled=running||Boolean(current?.extraction_needs_review);});
   document.querySelectorAll("[data-candidate-action]").forEach(button=>{button.disabled=running||button.dataset.candidateAllowed!=="true";});
   document.querySelectorAll(".candidate-manual input").forEach(input=>{input.disabled=running;});
 }
@@ -291,7 +331,7 @@ async function saveCandidateSelection(fieldId,candidateId,value,unit) {
   try{const body={field_id:fieldId,candidate_id:candidateId,source_confirmed:true,extraction_revision};if(candidateId==="manual")Object.assign(body,{value,unit});const saved=await api("/api/cases/"+id+"/candidate-selection","POST",body);if(current?.id===id){current=saved;syncActiveRecord();renderCase();await loadComparisonSources();notice("선택한 후보를 저장했습니다. 기존에 직접 입력한 값은 유지됩니다. 문서 대조에서 적용할 값을 다시 확인해 주세요.");}}finally{candidateRequestPending=false;updateSupplementControls();}
 }
 function renderDocumentExtraction(extraction, type) {
-  const key=current?.id+":"+current?.extraction_revision;if(key!==supplementSelectionKey){supplementSelectionKey=key;supplementSelection=new Set();}updateSupplementControls();
+  const key=current?.id+":"+current?.extraction_revision;if(key!==supplementSelectionKey){supplementSelectionKey=key;supplementSelection=new Set();}renderSupplementFields();updateSupplementControls();
   const container=$("document-extraction");container.replaceChildren();container.hidden=false;
   if(!extraction){container.append(node("p","AI 처리 후 문서 분류와 항목 후보가 여기에 표시됩니다.","muted"));return;}
   const classification=node("div",undefined,"classification-summary");classification.append(node("small","AI 문서 분류"),node("strong",profiles[type==="payslip_ocr"?"payslip":type]?.label||type),node("span","기본 읽기 A는 저장된 원문으로 항목을 정리합니다. 보완 읽기 B와 값이 같아도 사용자 확인이 필요합니다."));container.append(classification);
@@ -525,7 +565,7 @@ function updateControls() {
   $("confirm").disabled=!current||running||invalid||duplicateReviewNeeded||selectionPending||incompleteRows||extractionStale||!(current.extraction||current.materials?.sources?.length);
   $("confirmation-panel").hidden=!current;
   $("comparison-matrix").hidden=!isComparison();$("comparison-identity").hidden=!isComparison();$("confirm-compare").hidden=!isComparison();$("confirm").hidden=isComparison();$("analyze").hidden=comparisonMode||isComparison();$("time-kind").closest("label").hidden=isComparison();
-  $("confirm-compare").disabled=!isComparison()||running||comparisonSubmitting||invalid||selectionPending||duplicateReviewNeeded||incompleteRows||!current.materials?.sources?.length||!$("same-subject-confirmed").checked||comparisonHasBlockingIssues()||comparisonTimeBasisMissing();
+  renderComparisonActionState(comparisonActionBlockers({running,invalid,selectionPending,duplicateReviewNeeded,incompleteRows}));
   $("document-type").disabled=!current||isComparison()||running;
   $("analyze").disabled=!confirmed||running||selectionPending||extractionStale; $("explain").disabled=!fresh||running; $("report").disabled=!fresh||!current.explanation||running;
   $("confirmation-state").textContent=extractionStale?"추출 검증 갱신 필요":duplicateReviewNeeded?"중복 거래 후보 확인 필요":incompleteRows?"보완 항목명·페이지 확인 필요":confirmed?"확인 완료 · v"+current.confirmed_revision:"사용자 확인 필요";
@@ -540,6 +580,7 @@ function updateControls() {
   for(const [id,ready] of [["go-ai",Boolean(current?.ocr)],["go-compare",Boolean(current?.extraction)]])$(id).setAttribute("aria-disabled",String(!ready));
   renderComparisonGuidance();
   updateSupplementControls();
+  if(typeof updatePageControls==="function")updatePageControls();
 }
 function openSourceDocument(documentId,title,page=1) {
   if(!documentId)return;
@@ -566,6 +607,7 @@ function readForm() {
     manual:Object.fromEntries(Object.keys(manualLabels).map(k=>[k,$("manual-"+k).value.trim()||null])),time_kind:$("time-kind").value,
     earnings_complete:$("earnings-complete").checked,deductions_complete:$("deductions-complete").checked,payment_scope_confirmed:$("payment-confirmed").checked,material_review:readMaterialReview()};
   if(isComparison()){result.worked_time_kind=$("worked-time-kind").value;result.slip_time_kind=$("slip-time-kind").value;result.subjects_confirmed=$("same-subject-confirmed").checked;result.source_identity=readSourceIdentity();result.time_kind="";}
+  if(typeof readWageForm==="function")Object.assign(result,readWageForm());
   return result;
 }
 function changed() { if(!current)return; pendingDraft=true; current.dirty=true; current.stale=Boolean(current.analysis); updateStatementTotals(); updateComparisonCompatibility();renderExtractionChanges(); updateControls(); renderResults(); clearTimeout(draftTimer); draftTimer=setTimeout(()=>flushDraft().catch(e=>notice(e.message,true)),400); }
@@ -578,7 +620,9 @@ async function flushDraft() {
 async function start(stage) {
   if(!current)throw new Error("먼저 PDF를 업로드하거나 선택해 주세요.");
   if(stage==="extract"&&!current.ocr)throw new Error("원문 읽기 페이지에서 먼저 PDF를 읽어 주세요.");
+  if(stage==="report"&&typeof startReport==="function")return startReport();
   await flushDraft(); notice("");
+  if(stage==="analyze"){routeResultId="";resultVersionId="";}
   if(stage==="analyze")switchSection("results");
   currentJob=await api(caseApiPath()+"/jobs","POST",{stage,include_original:$("include-original").checked});
   renderJob(); pollJob();
@@ -593,8 +637,8 @@ function renderJob() {
   const statusLabels={queued:"접수됨",running:"실행 중",completed:"완료",failed:"실패",cancelled:"취소됨",interrupted:"중단됨",superseded:"이전 입력 결과 보류"};
   const last=currentJob.events?.at(-1);
   const phaseLabels={inspect_document:supplement?"선택 항목의 원본 PDF 준비":extraction?"저장 원문 불러오기":"PDF 텍스트·스캔 문자 읽기",extract_candidates:supplement?"선택 항목 보완 읽기":"AI 문서·항목 정리",verify_candidates:supplement?"보완 후보 형식·출처 확인":"원문·값 검증",package_candidates:"후보 저장"};
-  $(ocr?"ocr-job-status":extraction?"extraction-job-status":"job-status").textContent=(stageLabels[currentJob.stage]||"")+" · "+(supplement&&currentJob.status==="completed"?"보완 읽기 완료 · A·B값 확인 필요":extraction&&currentJob.status==="completed"?"항목 정리 완료 · "+extractionReviewCount(current?.extraction)+"개 확인 필요":statusLabels[currentJob.status]||currentJob.status)+((extraction||ocr)&&last?" / "+(phaseLabels[last.node_id]||"처리 중"):last?" / "+currentJob.events.length+"개 단계 진행":"")+(currentJob.error?" · "+currentJob.error+(currentJob.error_code?" ("+currentJob.error_code+")":"")+" · 작업 ID: "+currentJob.id:"")+(ocr?" · AI 토큰 0":currentJob.usage?.total_tokens?" · 누적 "+number(currentJob.usage.total_tokens)+" 토큰":"");
-  updateControls();
+  $(ocr?"ocr-job-status":extraction?"extraction-job-status":"job-status").textContent=(stageLabels[currentJob.stage]||"")+" · "+(supplement&&currentJob.status==="completed"?"보완 읽기 완료 · A·B값 확인 필요":extraction&&currentJob.status==="completed"?"항목 정리 완료 · "+extractionReviewCount(current?.extraction)+"개 확인 필요":statusLabels[currentJob.status]||currentJob.status)+((extraction||ocr)&&last?" / "+(phaseLabels[last.node_id]||"처리 중"):last?" / "+currentJob.events.length+"개 단계 진행":"")+(currentJob.error?" · 처리를 마치지 못했습니다. 개발 정보에서 상세 내용을 확인하세요.":"");
+  updateControls();if(typeof renderDevelopmentInfo==="function")renderDevelopmentInfo();
 }
 async function pollJob() {
   clearTimeout(pollTimer); if(!currentJob) return;
@@ -605,49 +649,63 @@ async function pollJob() {
     else {await flushDraft();current=await api(caseApiPath());syncActiveRecord();renderCase();renderJob();if(job.stage==="extract"&&job.status==="completed")await loadComparisonSources();}
   } catch(error) {notice("상태 조회가 중단됐습니다. 새로고침하면 저장한 작업을 다시 확인합니다. "+error.message,true);}
 }
-function renderResults() { renderComparisonResults(); updateControls(); }
+function renderResults() { renderComparisonResults(); updateControls(); if(typeof renderWorkPages==="function")renderWorkPages(); }
 
 function updateRouteLinks() {
-  document.querySelectorAll("a[data-route]").forEach(link=>{link.href=routeUrl(link.dataset.route);if(link.closest(".workflow-nav"))link.setAttribute("aria-current",link.dataset.route===activeRoute?"step":"false");});
+  document.querySelectorAll("a[data-route]").forEach(link=>{link.href=routeUrl(link.dataset.route);if(link.closest(".workflow-nav"))link.setAttribute("aria-current",link.dataset.route===activeRoute?"page":"false");});
 }
 function renderRoute() {
   const info=routeInfo[activeRoute];
   for(const route of Object.keys(routeInfo))$(route+"-page").hidden=route!==activeRoute;
-  $("workspace").hidden=activeRoute==="compare";
-  $("workspace").classList.remove("source-peek");
-  $("page-title").textContent=info.title;$("page-description").textContent=info.description;$("page-eyebrow").textContent=info.eyebrow;$("page-step").textContent=info.step+" / 3";
-  document.title="월급잇다 · "+({ocr:"OCR 추출",ai:"AI 처리",compare:"문서 대조"}[activeRoute]);
-  document.body.dataset.route=activeRoute;updateRouteLinks();
-  if(typeof document.querySelector==="function"){if(activeRoute!=="compare"){$("workspace").insertBefore($("source-panel"),$("workspace").firstChild);closeComparisonSource();}$("comparison-picker").hidden=!comparisonMode&&activeRoute!=="compare";}
+  $("workspace").hidden=!["ocr","ai"].includes(activeRoute);$("workspace").classList.remove("source-peek");
+  $("document-library").hidden=!["ocr","ai"].includes(activeRoute);
+  $("page-title").textContent=info.title;$("page-description").textContent=info.description;$("page-eyebrow").textContent=info.eyebrow;$("page-step").textContent=info.eyebrow;
+  document.title="월급잇다 · "+info.title;document.body.dataset.route=activeRoute;updateRouteLinks();
+  if(typeof document.querySelector==="function"){
+    if(["ocr","ai"].includes(activeRoute)){$("workspace").insertBefore($("source-panel"),$("workspace").firstChild);closeComparisonSource();}
+    $("comparison-picker").hidden=activeRoute!=="compare";
+  }
+  if(typeof renderWorkPages==="function")renderWorkPages();
 }
-async function navigateRoute(route, push=true) {
-  if(loadingMaterials||comparisonSubmitting||candidateRequestPending)return;
-  if(!Object.hasOwn(routeInfo,route))return;
-  await flushDraft();syncActiveRecord();clearTimeout(pollTimer);currentJob=null;activeRoute=route;
-  if(route==="compare"){comparisonMode=true;current=comparisonCase;await Promise.all([loadComparisons(),loadComparisonSources()]);if(!current){const saved=localStorage.getItem("agent-last-comparison");if(saved&&comparisonRecords.some(item=>item.id===saved))await openComparison(saved);else renderComparisonPicker();}else{renderCase();await restoreCurrentJob();}}
-  else{comparisonMode=false;current=documentCase;if(!current){const saved=localStorage.getItem("agent-last-case");if(saved){try{const restored=await api("/api/cases/"+saved);if(docs.some(doc=>doc.id===restored.document_id))current=documentCase=restored;}catch{localStorage.removeItem("agent-last-case");}}}if(current){renderCase();await restoreCurrentJob();}else{renderOcr();updateControls();}}
-  if(push)history.pushState(null,"",routeUrl(route));
-  renderRoute();notice("");
+async function navigateRoute(route,push=true) {
+  if(loadingMaterials||comparisonSubmitting||candidateRequestPending||!Object.hasOwn(routeInfo,route))return;
+  const requestedUrl=routeUrl(route);
+  await flushDraft();if(typeof flushInquiry==="function")await flushInquiry();syncActiveRecord();clearTimeout(pollTimer);currentJob=null;activeRoute=route;
+  if(payrollRoute(route)&&!comparisonCase&&!routeComparisonId&&documentCase?.analysis){comparisonMode=false;current=documentCase;renderCase();await restoreCurrentJob();}
+  else if(payrollRoute(route)){
+    comparisonMode=true;current=comparisonCase;
+    await Promise.all([loadComparisons(),loadComparisonSources()]);
+    if(!current){const saved=routeComparisonId||localStorage.getItem("agent-last-comparison");if(saved&&comparisonRecords.some(item=>item.id===saved))await openComparison(saved);else{current=null;renderComparisonPicker();renderResults();}}
+    else{renderCase();await restoreCurrentJob();}
+  }else if(route!=="glossary"){
+    comparisonMode=false;current=documentCase;
+    await loadDocuments();
+    if(!current){const saved=localStorage.getItem("agent-last-case");if(saved){try{const restored=await api("/api/cases/"+saved);if(docs.some(doc=>doc.id===restored.document_id))current=documentCase=restored;}catch{localStorage.removeItem("agent-last-case");}}}
+    if(current){renderCase();await restoreCurrentJob();}else{renderOcr();updateControls();}
+  }
+  if(push)history.pushState(null,"",route==="glossary"?requestedUrl:routeUrl(route));renderRoute();notice("");
+  if(route==="glossary"&&typeof loadGlossary==="function")await loadGlossary();
 }
 async function restoreHistoryRoute() {
   if(loadingMaterials||comparisonSubmitting||candidateRequestPending){history.replaceState(null,"",routeUrl(activeRoute));return;}
-  const route=location.pathname.split("/")[1],params=new URLSearchParams(location.search),caseId=params.get("case");
-  if(route==="compare"){activeRoute="compare";await openComparison(params.get("comparison"));return;}
-  await flushDraft();
-  if(caseId&&caseId!==current?.id){const restored=await api("/api/cases/"+caseId);if(docs.some(doc=>doc.id===restored.document_id)){clearTimeout(pollTimer);currentJob=null;current=restored;renderCase();await restoreCurrentJob();}}
-  await navigateRoute(Object.hasOwn(routeInfo,route)?route:"ocr",false);
+  await flushDraft();if(typeof flushInquiry==="function")await flushInquiry();
+  const params=new URLSearchParams(location.search),route=location.pathname.split("/")[1];
+  routeResultId=params.get("result")||"";resultVersionId=routeResultId;routeComparisonId=params.get("comparison")||"";
+  activeRoute=Object.hasOwn(routeInfo,route)?route:"ocr";
+  if(routeComparisonId&&comparisonCase?.id!==routeComparisonId)comparisonCase=await api("/api/comparisons/"+encodeURIComponent(routeComparisonId));
+  if(!routeComparisonId&&payrollRoute(activeRoute))comparisonCase=null;
+  const caseId=params.get("case");if(caseId&&documentCase?.id!==caseId)documentCase=await api("/api/cases/"+encodeURIComponent(caseId));
+  current=payrollRoute(activeRoute)?comparisonCase||documentCase:activeRoute==="glossary"?current:documentCase;
+  await navigateRoute(activeRoute,false);
 }
 function switchSection(section) {
-  activeRoute=section==="workspace"?"compare":section==="results"?"compare":section;
+  activeRoute=section==="workspace"?"compare":section;
   if(!Object.hasOwn(routeInfo,activeRoute))activeRoute="ocr";
   history.pushState(null,"",routeUrl(activeRoute));renderRoute();
-  if(section==="results"&&typeof $("results-view").scrollIntoView==="function")$("results-view").scrollIntoView({block:"start",behavior:"auto"});
 }
 function showConfirmation() {
   switchSection("compare");$("manual-section").open=true;
-  const heading=$("confirmation-heading");
-  if(typeof heading.focus==="function")heading.focus({preventScroll:true});
-  if(typeof heading.scrollIntoView==="function")heading.scrollIntoView({block:"start",behavior:"auto"});
+  const heading=$("confirmation-heading");if(typeof heading.focus==="function")heading.focus({preventScroll:true});if(typeof heading.scrollIntoView==="function")heading.scrollIntoView({block:"start",behavior:"auto"});
 }
 function populateDocumentTypes(select) {
   const selected=select.value==="payslip_ocr"?"payslip":select.value;
@@ -659,6 +717,7 @@ function populateDocumentTypes(select) {
 async function initialize() {
   renderRoute();
   profiles=await api("/api/extraction-profiles");populateDocumentTypes($("document-type"));buildFields();
+  if(typeof initializeWorkPages==="function")initializeWorkPages();
   document.querySelectorAll("a[data-route]").forEach(link=>link.addEventListener("click",safeAction(async event=>{event.preventDefault();if(link.getAttribute("aria-disabled")==="true")return;await navigateRoute(link.dataset.route);})));
   window.addEventListener("popstate",safeAction(restoreHistoryRoute));
   $("refresh-materials").addEventListener("click",safeAction(loadComparisonSources));
@@ -679,11 +738,12 @@ async function initialize() {
     $(prefix+"resume").addEventListener("click",safeAction(async()=>{await flushDraft();currentJob=await api("/api/jobs/"+currentJob.id+"/resume","POST",{});renderJob();pollJob();}));
   }
   $("upload").addEventListener("change",safeAction(async event=>{const file=event.target.files[0];if(!file)return;await flushDraft();if(file.size>20*1024*1024)throw new Error("20MB 이하 PDF를 선택해 주세요.");const response=await fetch("/api/uploads?document_type=auto",{method:"POST",headers:{"Content-Type":"application/pdf","X-Local-Agent":"1","X-Document-Name":encodeURIComponent(file.name)},body:file});const result=await response.json();if(!response.ok)throw new Error(result.error);current=result;currentJob=null;clearTimeout(pollTimer);await loadDocuments();await navigateRoute("ocr");rememberCase();renderCase();await loadComparisonSources();notice("PDF를 업로드했습니다. OCR 추출을 실행해 주세요.");event.target.value="";}));
-  const health=await api("/api/health");$("connection").textContent="로컬 OCR · AI "+(health.model||"연결됨");
+  const health=await api("/api/health");$("connection").textContent="로컬 작업실 연결됨";if(typeof setDevelopmentHealth==="function")setDevelopmentHealth(health);
+  if(activeRoute==="glossary"&&typeof loadGlossary==="function"){await loadGlossary();renderRoute();return;}
   await loadDocuments();
   if(await initializeComparisons())return;
   const saved=new URLSearchParams(location.search).get("case")||localStorage.getItem("agent-last-case");
-  if(saved){try{const restored=await api("/api/cases/"+saved);if(docs.some(doc=>doc.id===restored.document_id)){current=restored;rememberCase();renderCase();await restoreCurrentJob();return;}}catch{/* Removed records do not prevent a fresh upload. */}localStorage.removeItem("agent-last-case");history.replaceState(null,"",routeUrl(activeRoute));}
+  if(saved){try{const restored=await api("/api/cases/"+saved);if(docs.some(doc=>doc.id===restored.document_id)){current=restored;rememberCase();renderCase();await restoreCurrentJob();return;}}catch{/* Removed records do not prevent a fresh upload. */}if(new URLSearchParams(location.search).get("case")){current=documentCase=null;renderRoute();notice("주소의 문서를 찾을 수 없습니다. 다른 문서로 자동 이동하지 않았습니다.",true);return;}localStorage.removeItem("agent-last-case");history.replaceState(null,"",routeUrl(activeRoute));}
   if(docs[0])await selectDocument(docs[0].id);else{renderOcr();renderMaterials();renderResults();updateControls();}
 }
 initialize().catch(error=>{$("connection").textContent="연결 확인 필요";notice(error.message,true);});
