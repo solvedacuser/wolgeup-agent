@@ -107,8 +107,6 @@ outcome = await run_task(
 연결 규격과 예제:
 
 - [백엔드 연결 계약](devmerge/agent/README.md#백엔드-연결-계약)
-- [입력 스키마](devmerge/agent/contracts/AgentTask.schema.json)
-- [출력 스키마](devmerge/agent/contracts/AgentOutcome.schema.json)
 - [요청·응답 예제](devmerge/agent/tests/contracts/)
 
 ## 검증
@@ -120,12 +118,6 @@ uv run pytest -q
 uv run ruff check app agent tests/integration tests/backend/test_retained.py
 ```
 
-실제 모델·스캔 OCR 품질 검증과 자동 테스트의 범위는 구분합니다. 검증 결과와 남은 작업은 다음 문서에서 확인합니다.
-
-- [통합 구조와 저장·호출 흐름](devmerge/docs/ARCHITECTURE.md)
-- [검증 기록](devmerge/docs/VERIFICATION.md)
-- [요구사항 검토표](devmerge/docs/REQUIREMENTS_MATRIX.md)
-- [임금 계산 지원 범위](devmerge/agent/PAYROLL.md)
 
 ## 지원 범위
 
