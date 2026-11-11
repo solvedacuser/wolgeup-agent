@@ -1,6 +1,6 @@
 # 월급잇다 통합 백엔드 (devmerge)
 
-`feat/devmerge-integration` 브랜치의 통합 실행 대상은 **`devmerge/`**입니다.
+`feat/devmerge-integration` 브랜치의 통합 실행 대상은 `devmerge/` 임
 
 FastAPI 백엔드가 에이전트를 Python 함수로 직접 호출하며, Python 3.14 한 환경에서 실행합니다. Next.js 프론트엔드는 별도 프로젝트에서 이 API를 사용합니다.
 
