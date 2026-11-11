@@ -1,48 +1,164 @@
-# wolgeup-agent
+# 월급잇다 통합 백엔드 (devmerge)
 
-계약서·근무기록·급여명세서·입금기록을 읽고, 사용자가 확인한 항목으로 임금을 계산·대조하는 Python 에이전트와 로컬 개발 화면입니다. 현재 계산 엔진은 `agent-0.4.0`입니다.
+`feat/devmerge-integration` 브랜치의 통합 실행 대상은 **`devmerge/`**입니다.
 
-## 설치·실행
+FastAPI 백엔드가 에이전트를 Python 함수로 직접 호출하며, Python 3.14 한 환경에서 실행합니다. Next.js 프론트엔드는 별도 프로젝트에서 이 API를 사용합니다.
 
-Python 3.14와 uv가 필요합니다. 저장소 루트에서 실행합니다.
+## 폴더 구분
+
+| 경로 | 역할 |
+| --- | --- |
+| `agent/` | 기존 독립 에이전트와 로컬 개발 화면 보존본 |
+| `devmerge/app/` | FastAPI API, 인증, DB, 작업 관리와 에이전트 연결 |
+| `devmerge/agent/` | 통합본에서 사용하는 추출·계산·대조·설명·보고서 처리 모듈 |
+| `devmerge/docs/` | 통합 구조, 요구사항 검토와 검증 기록 |
+
+**설치·실행·테스트는 모두 `devmerge/`에서 진행합니다.**
+
+통합본은 루트 `agent/`를 참조하지 않습니다. `agent.dev.test_server`는 기존 개발 화면용이며, 통합 API 실행 명령은 `python -m app`입니다.
+
+## 설치·실행 — Windows PowerShell
+
+Git과 [uv](https://docs.astral.sh/uv/getting-started/installation/)를 설치한 뒤 실행합니다.
 
 ```powershell
-git clone https://github.com/solvedacuser/wolgeup-agent.git
-cd wolgeup-agent
+git clone --branch feat/devmerge-integration https://github.com/solvedacuser/wolgeup-agent.git
+cd wolgeup-agent/devmerge
+
+uv python install 3.14
 uv sync --locked
-Copy-Item agent/.env.example agent/.env
-# agent/.env에 OpenAI API 키와 모델 설정 입력
-uv run python -m agent.dev.test_server --port 4190
+Copy-Item .env.example .env
+
+# .env에서 API 키와 필요한 설정을 입력한 뒤 실행
+uv run python -m app
 ```
 
-[로컬 화면](http://127.0.0.1:4190)을 엽니다. 스캔 문서는 [OCR 설치 안내](agent/dev/OCR.md)에 따라 준비합니다. 원문 미리보기에는 Poppler, 한글 보고서에는 한글 TrueType 글꼴이 필요합니다.
+이미 저장소를 받았다면 해당 브랜치의 `devmerge/`로 이동합니다. `.env` 복사는 최초 1회만 수행하며, 기존 설정이 있으면 그대로 수정합니다.
 
-## 사용 흐름
+| 접속 주소 | 용도 |
+| --- | --- |
+| http://127.0.0.1:8000/docs | Swagger API 문서와 요청 테스트 |
+| http://127.0.0.1:8000/health | 서버 상태 확인 |
+| http://127.0.0.1:8000/openapi.json | OpenAPI 명세 |
 
-1. **원문 읽기:** 디지털 PDF 텍스트를 우선 사용하고 품질이 부족한 페이지는 로컬 OCR로 읽습니다.
-2. **AI 처리 A:** 저장 텍스트로 유형·항목·표를 정리합니다. 오류 항목은 확인 필요로 남기고 정상 후보는 보존합니다.
-3. **선택 보완 B:** 필요한 미확인 항목 1~50개를 선택해 PDF를 다시 판독합니다.
-4. **문서 대조:** 원문을 보고 후보 선택·직접 수정·보류한 뒤, 확인한 자료를 독립 비교 묶음에서 대조합니다. 조건과 근무기록을 확인하면 지원 범위의 시급·월급을 계산합니다.
-5. **결과 활용:** 결과·확인 질문·회사 문의·자료 받기·쉬운 용어를 각각 독립 화면에서 확인합니다. 문의 초안을 편집하고 결과별 PDF와 선택 원본 ZIP을 받을 수 있습니다.
+## 환경 설정
 
-A는 텍스트만 AI에 전송합니다. **B는 사용자가 별도로 실행할 때 원본 전체 PDF를 OpenAI에 전송하며 추가 비용이 발생합니다.** 선택 항목이나 페이지만 잘라 보내는 방식은 아닙니다. 기본 화면에서 AI 호출은 A/B에만 사용하며 원문 읽기·계산·대조·설명·질문·문의·용어·보고서는 모델을 호출하지 않습니다. 이미 시작한 요청은 취소해도 비용이 발생할 수 있습니다.
+설정 파일은 **`devmerge/.env`**입니다. 루트 `agent/.env`와 구분합니다.
 
-A/B 후보와 선택 이력을 따로 보존합니다. B 완료나 두 후보의 일치로 자동 확정하지 않으며, 정상 후보도 원문 확인 후 사용합니다. 기존 자료를 자동 재처리하지 않습니다.
+| 설정 | 용도 |
+| --- | --- |
+| `OPENAI_API_KEY` | AI 추출 A, 선택적 PDF 보완 B, 자유 채팅에 필요한 키 |
+| `AGENT_OCR_COMMAND` | Tesseract 실행 명령 또는 실행파일 경로 |
+| `AGENT_OCR_DATA_PATH` | `kor.traineddata`와 `eng.traineddata`가 있는 언어 데이터 폴더 |
+| `AGENT_FONT_PATH` | 한글 보고서 생성에 사용할 폰트 경로 |
+| `DATA_DIR` | DB·업로드·산출물 저장 위치. 기본값 `./data` |
+| `CORS_ORIGINS` | API 접근을 허용할 프론트엔드 주소의 JSON 배열 |
+| `WORKER_CONCURRENCY` | 작업 동시 실행 수. 기본값 1, 최대 4 |
 
-## 범위·검사
+디지털 PDF 읽기, 계산·대조, 템플릿 설명·질문·문의, PDF·ZIP 생성은 모델 키 없이 실행합니다. AI 추출·PDF 보완·자유 채팅은 API 키가 필요하며, 키가 없으면 오류를 반환합니다.
 
-단일 사용자·단일 프로세스용 개발 도구입니다. 운영 인증·사용자 격리·DB·작업 큐·상담기관 후보 필터링은 별도 구현이 필요합니다. 자료 간 단가·시간·명세서 합계·입금과, 표준 근무 조건의 기본급·주휴·연장·야간·휴일 임금을 계산·대조합니다. 지원 조건·기간은 [임금 기능 안내](agent/PAYROLL.md)를 따르며 전체 미지급액을 확정하지 않습니다.
+스캔 PDF·JPEG·PNG 읽기에는 [Tesseract](https://tesseract-ocr.github.io/tessdoc/Installation.html)와 한국어·영어 언어 데이터가 필요합니다. 예제의 `AGENT_OCR_DATA_PATH=assets/tessdata`는 실제 언어 데이터 설치 경로로 수정해야 합니다.
 
-명세서 기본급과 비교 기준값 연결, 항목 전체 확인 여부, 선택하지 않은 근무·입금 자료와 임금 재계산 상태가 현재 결과 화면에서 모두 ‘정보 부족’으로 표시될 수 있습니다. 이번 버전에는 이 상태들을 구분하는 개선이 아직 포함되지 않았습니다.
+한글 보고서 폰트는 `devmerge/assets/fonts/`에 포함되어 있습니다.
+
+## 처리 흐름
+
+1. 회원가입·로그인 후 사업장과 급여기간 사례를 생성합니다.
+2. 문서를 업로드·연결하고 원문 읽기 결과를 저장합니다.
+3. AI 추출 A를 실행하고, 필요한 항목만 PDF 보완 B로 처리합니다.
+4. 사용자가 후보를 선택·수정·보류하고, 비교 묶음별 문서와 확인 입력을 저장합니다.
+5. 분석을 요청하면 백엔드가 입력 스냅샷을 고정하고 에이전트 함수를 실행합니다.
+6. 확정 결과를 기준으로 설명·회사 문의·PDF·선택 원본 ZIP을 생성합니다.
+
+PDF 보완 B는 사용자가 선택한 항목을 확인하기 위해 **전체 PDF를 외부 모델에 전송하는 별도 작업**입니다. 업로드·원문 읽기·계산 과정에서 자동 실행하지 않습니다.
+
+A/B 추출 결과는 후보이며, 사용자 확인 후 계산 입력으로 사용합니다.
+
+## 백엔드와 에이전트 연결
+
+백엔드의 비동기 작업 처리 코드에서 에이전트를 직접 호출합니다.
+
+```python
+from agent import run_task
+
+outcome = await run_task(
+    task,
+    ports=ports,
+    settings=agent_settings,
+)
+```
+
+| 항목 | 내용 |
+| --- | --- |
+| `task` | 작업 종류와 입력을 담은 `AgentTask` |
+| `ports` | 자료 읽기·권한 확인·체크포인트·산출물 저장 기능을 제공하는 객체 |
+| `agent_settings` | 모델·시간 제한·호출 예산 등을 담은 `AgentSettings` |
+| `outcome` | 완료·실패·취소 상태와 작업 결과를 담은 `AgentOutcome` |
+
+에이전트 핵심 모듈은 FastAPI나 백엔드 DB를 직접 사용하지 않습니다.
+
+- `app/agent_ports.py`: 백엔드의 DB·파일 접근 구현
+- `app/agent_service.py`: 작업 실행과 최종 결과 확정
+- `agent/runner.py`: 에이전트 작업 실행
+- `agent/runtime.py`: 실행 상태·체크포인트·AI 호출 관리
+
+별도 에이전트 HTTP 서버는 필요하지 않습니다.
+
+연결 규격과 예제:
+
+- [백엔드 연결 계약](devmerge/agent/README.md#백엔드-연결-계약)
+- [입력 스키마](devmerge/agent/contracts/AgentTask.schema.json)
+- [출력 스키마](devmerge/agent/contracts/AgentOutcome.schema.json)
+- [요청·응답 예제](devmerge/agent/tests/contracts/)
+
+## 검증
+
+`devmerge/`에서 실행합니다.
 
 ```powershell
 uv run pytest -q
-uv run ruff check agent
-uv run ruff format --check agent
+uv run ruff check app agent tests/integration tests/backend/test_retained.py
 ```
 
-일반 회귀 검사는 합성 자료와 가짜 공급자를 사용합니다. 원본 평가 자료가 필요한 검사는 자료가 없으면 건너뛰며, UI 회귀에는 Node.js가 필요합니다. 실제 AI 정확도 평가는 별도입니다.
+실제 모델·스캔 OCR 품질 검증과 자동 테스트의 범위는 구분합니다. 검증 결과와 남은 작업은 다음 문서에서 확인합니다.
 
-API 키·업로드 문서·실행 결과는 커밋하지 않습니다. 로컬 결과는 `output/document-workspace/`에 저장됩니다.
+- [통합 구조와 저장·호출 흐름](devmerge/docs/ARCHITECTURE.md)
+- [검증 기록](devmerge/docs/VERIFICATION.md)
+- [요구사항 검토표](devmerge/docs/REQUIREMENTS_MATRIX.md)
+- [임금 계산 지원 범위](devmerge/agent/PAYROLL.md)
 
-[연결 계약](agent/README.md) · [화면·API](agent/dev/README.md) · [현재 구현 범위](agent/IMPLEMENTATION_STATUS.md)
+## 지원 범위
+
+- 단일 서버 프로세스를 지원합니다. Uvicorn 다중 프로세스 실행은 지원하지 않습니다.
+- 임금 계산은 표준 시급·월급 조건을 지원합니다.
+- 정보 부족·모름·보류·충돌을 0으로 계산하지 않습니다.
+- 작업의 `COMPLETED` 상태는 결과 저장 완료를 뜻하며, 모든 임금 항목의 계산 완료를 뜻하지 않습니다.
+- 운영 프론트엔드 화면은 포함하지 않습니다.
+
+## Linux — 핵심 설치·실행
+
+Git과 `uv` 설치 후 실행합니다. `.env` 복사는 최초 1회만 수행합니다.
+
+```bash
+git clone --branch feat/devmerge-integration https://github.com/solvedacuser/wolgeup-agent.git
+cd wolgeup-agent/devmerge
+
+uv python install 3.14
+uv sync --locked
+cp .env.example .env
+
+# .env 설정 후 실행
+uv run python -m app
+```
+
+스캔 문서를 읽는 경우 Ubuntu/Debian에서는 OCR도 설치합니다.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng
+tesseract --list-langs
+```
+
+`.env`의 `AGENT_OCR_COMMAND`는 `tesseract`로 설정하고, `AGENT_OCR_DATA_PATH`는 위 명령에 표시되는 언어 데이터 경로로 변경합니다. `kor`·`eng`가 모두 표시되는지 확인합니다.
+
+실행 후 API 문서: http://127.0.0.1:8000/docs
