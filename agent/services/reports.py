@@ -335,9 +335,13 @@ async def build_report(runtime):
             or content_hash(content.data) != source.content_hash
         ):
             raise IntegrityError("Original source changed")
-        if len(content.data) > runtime.settings.max_file_bytes or content.mime_type != "application/pdf":
-            raise IntegrityError("Selected original exceeds limits or is not PDF")
-        originals[f"originals/{index:03d}-{content_hash(source.source_id.encode())[:12]}.pdf"] = content.data
+        extensions = {"application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg"}
+        if len(content.data) > runtime.settings.max_file_bytes or content.mime_type not in extensions:
+            raise IntegrityError("Selected original exceeds limits or has unsupported media type")
+        extension = extensions[content.mime_type]
+        originals[f"originals/{index:03d}-{content_hash(source.source_id.encode())[:12]}{extension}"] = (
+            content.data
+        )
     await runtime.control()
     pdf = await asyncio.to_thread(
         render_pdf, result, explanation, runtime.settings, payload.generated_at, payload.display_context

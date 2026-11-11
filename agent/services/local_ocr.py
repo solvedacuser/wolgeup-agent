@@ -5,13 +5,13 @@ import io
 import os
 import shutil
 import subprocess
-import threading
 from pathlib import Path
 
 from agent.schemas.public.errors import OCRFailed, OCRUnavailable
+from agent.services.pdf_lock import PDF_LOCK
 
 ROOT = Path(__file__).resolve().parents[2]
-OCR_LOCK = threading.Lock()  # PDFium is not thread-safe across documents either.
+OCR_LOCK = PDF_LOCK
 
 
 def executable(settings):

@@ -20,6 +20,8 @@ from pydantic import ValidationError
 from agent.config import ENGINE_VERSION, AgentSettings
 from agent.dev.local_workflow import LOCAL_OUTPUT, ComparisonInputError, LocalStore
 from agent.dev.pdf_preview import render_page
+from agent.review.http import route as review_route
+from agent.review.store import RevisionConflict
 from agent.services.extraction_profiles import PROFILES
 
 WEB = Path(__file__).parent / "web"
@@ -89,18 +91,20 @@ class Handler(BaseHTTPRequestHandler):
         if mutation and self.headers.get("X-Local-Agent") != "1":
             raise PermissionError("로컬 화면의 요청 헤더가 필요합니다.")
 
-    def body(self, *, pdf=False):
+    def body(self, *, pdf=False, binary=False):
         try:
             length = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
             raise ValueError("잘못된 요청 길이입니다.") from None
-        limit = self.server.store.settings.max_file_bytes if pdf else 256 * 1024
+        limit = self.server.store.settings.max_file_bytes if pdf or binary else 256 * 1024
         if not 0 <= length <= limit:
             raise ValueError("요청 크기 제한을 초과했습니다.")
         self.connection.settimeout(20)
         data = self.rfile.read(length)
         if len(data) != length:
             raise ValueError("업로드가 완료되지 않았습니다.")
+        if binary:
+            return data
         if pdf:
             if self.headers.get("Content-Type", "").split(";")[0] != "application/pdf":
                 raise ValueError("PDF 형식으로 업로드해 주세요.")
@@ -128,6 +132,8 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": "자료 또는 작업을 찾을 수 없습니다."})
         except ComparisonInputError as exc:
             self.respond(400, {"error": str(exc)})
+        except RevisionConflict as exc:
+            self.respond(409, {"error": str(exc)})
         except ValueError, ValidationError, TypeError:
             self.respond(
                 400,
@@ -140,6 +146,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self, method, path):
         store, call = self.server.store, self.server.call
+        try:
+            if review_route(self, method, path):
+                return
+        except RevisionConflict:
+            raise
+        except ValueError as exc:
+            return self.respond(400, {"error": str(exc)})
         assets = {
             "/": ("index.html", "text/html; charset=utf-8"),
             "/ocr": ("index.html", "text/html; charset=utf-8"),
@@ -201,6 +214,14 @@ class Handler(BaseHTTPRequestHandler):
             doc_id, page = match[1], int(match[2])
             if not 1 <= page <= store.documents[doc_id]["pages"]:
                 raise ValueError("Invalid page")
+            if store.documents[doc_id].get("media_type", "application/pdf") != "application/pdf":
+                from agent.review.reading import png_bytes
+
+                return self.respond(
+                    200,
+                    png_bytes(store.document_data(doc_id), store.documents[doc_id]["media_type"], page),
+                    "image/png",
+                )
             return self.respond(
                 200, render_page(store.document_data(doc_id), page, store.state / "previews"), "image/png"
             )
@@ -275,6 +296,11 @@ class Handler(BaseHTTPRequestHandler):
         match = re.fullmatch(r"/api/jobs/([a-z0-9-]+)(?:/(cancel|resume))?", path)
         if match:
             jid, action = match.groups()
+            if jid in store.reviews.jobs:
+                if method == "GET" and action is None:
+                    return self.respond(200, store.reviews.job_view(store.reviews.jobs[jid]))
+                if method == "POST" and action in ("cancel", "resume"):
+                    return self.respond(202, call(store.reviews.control_job(jid, action)))
             if method == "GET" and action is None:
                 return self.respond(200, call(store.get_job(jid)))
             if method == "POST" and action in ("cancel", "resume"):
@@ -318,9 +344,16 @@ def main():
         server.server_close()
 
         async def shutdown():
-            for task in store.tasks.values():
+            tasks = [
+                *store.tasks.values(),
+                *store.reviews.tasks.values(),
+                *store.reviews.request_tasks.values(),
+                *store.reviews.chat.tasks.values(),
+                *store.reviews.recommendations.tasks.values(),
+            ]
+            for task in tasks:
                 task.cancel()
-            await asyncio.gather(*store.tasks.values(), return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         asyncio.run_coroutine_threadsafe(shutdown(), loop).result(timeout=10)
         loop.call_soon_threadsafe(loop.stop)

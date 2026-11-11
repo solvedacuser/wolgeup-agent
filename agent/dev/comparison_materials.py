@@ -24,7 +24,7 @@ from agent.services.extraction_profiles import (
     statement_row_role,
 )
 from agent.services.extraction_review import candidate_value, row_requires_replacement, validation_metadata
-from agent.services.hashing import digest, snapshot_hash
+from agent.services.hashing import content_hash, digest, snapshot_hash
 
 SELECTION_TYPES = {
     "contract_case_id": {"contract"},
@@ -251,11 +251,12 @@ def build_materials(store, selection: dict) -> dict:
         "transactions": [],
         "work_rows": [],
         "evidence_catalog": [],
+        "manual_sources": [],
         "field_evidence": {},
         "field_validation": {},
         "warnings": [],
     }
-    seen_hashes, evidence_by_id, source_by_id = set(), {}, {}
+    seen_hashes, evidence_by_id, source_by_id = {}, {}, {}
     source_data, transaction_identities = [], []
     for selection_key, case_id in _selected(selection):
         if case_id not in store.cases:
@@ -269,21 +270,38 @@ def build_materials(store, selection: dict) -> dict:
             raise ValueError("선택한 자료를 먼저 현재 문서 유형으로 추출해 주세요.")
         document_id = case["document_id"]
         document = store.documents[document_id]
-        if document["sha256"] in seen_hashes:
+        part_range = document.get("part_range")
+        pages = set(range(part_range[0], part_range[1] + 1)) if part_range else None
+        previous_pages = seen_hashes.get(document["sha256"])
+        if document["sha256"] in seen_hashes and (
+            pages is None or previous_pages is None or pages & previous_pages
+        ):
             raise ValueError("동일한 파일을 여러 자료로 중복 선택할 수 없습니다.")
-        seen_hashes.add(document["sha256"])
+        seen_hashes[document["sha256"]] = (previous_pages or set()) | pages if pages is not None else None
         ref = SourceRef.model_validate(store.document_ref(document_id))
         ref_json = ref.model_dump(mode="json")
         if ref.source_id in source_by_id and source_by_id[ref.source_id] != ref_json:
             raise ValueError("자료 식별자가 서로 충돌합니다.")
         source_by_id[ref.source_id] = ref_json
+        manual_refs = {}
+        for manual in case.get("review_manual_sources", []):
+            manual_ref = SourceRef.model_validate(manual["ref"])
+            if (
+                manual_ref.kind != "manual"
+                or manual_ref.owner_id != ref.owner_id
+                or manual_ref.workplace_id != ref.workplace_id
+                or content_hash(manual["data"].encode()) != manual_ref.content_hash
+            ):
+                raise ValueError("수기 확인 근거를 검증하지 못했습니다.")
+            manual_refs[manual_ref.source_id] = manual_ref
+            result["manual_sources"].append(manual)
         fields = {field["field_id"]: field for field in extraction["fields"]}
         if len(fields) != len(extraction["fields"]):
             raise ValueError("중복된 추출 필드가 있습니다.")
         local_evidence_ids = set()
         for item in extraction.get("evidence_catalog", []):
             evidence = EvidenceRef.model_validate(item)
-            if evidence.source_id != ref.source_id:
+            if evidence.source_id != ref.source_id and evidence.source_id not in manual_refs:
                 raise ValueError("추출 근거가 선택한 원문에 속하지 않습니다.")
             serialized = evidence.model_dump(mode="json")
             if evidence.evidence_id in evidence_by_id and evidence_by_id[evidence.evidence_id] != serialized:
@@ -306,7 +324,8 @@ def build_materials(store, selection: dict) -> dict:
                 "page_count": extraction.get("page_count") or document.get("pages"),
             }
         )
-        source_data.append((case_id, kind, document["sha256"], fields))
+        row_namespace = digest([document["sha256"], part_range]) if part_range else document["sha256"]
+        source_data.append((case_id, kind, row_namespace, fields))
         if extraction.get("verification_method") in ("vision_unverified", "ocr_unverified"):
             result["warnings"].append(
                 f"{document.get('title', document_id)}: 인식한 값을 원문과 대조해 확인해 주세요."
@@ -635,7 +654,10 @@ def enrich_snapshot(snapshot, materials, review: dict) -> InputSnapshot:
     if not isinstance(distinct_confirmed, bool):
         raise ValueError("별개 입금 거래 확인 여부는 참 또는 거짓이어야 합니다.")
     snapshot.authorized_sources = _merge_models(
-        snapshot.authorized_sources, [s["ref"] for s in materials["sources"]], SourceRef, "source_id"
+        snapshot.authorized_sources,
+        [s["ref"] for s in materials["sources"]] + [s["ref"] for s in materials.get("manual_sources", [])],
+        SourceRef,
+        "source_id",
     )
     snapshot.evidence_catalog = _merge_models(
         snapshot.evidence_catalog, materials["evidence_catalog"], EvidenceRef, "evidence_id"

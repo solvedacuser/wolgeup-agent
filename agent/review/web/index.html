@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>월급잇다 · 월급 검토</title>
+    <link rel="stylesheet" href="/review/styles.css" />
+    <link rel="stylesheet" href="/review/chat.css" />
+    <script defer src="/review/app.js"></script>
+    <script defer src="/review/recommendations.js"></script>
+    <script defer src="/review/chat.js"></script>
+  </head>
+  <body>
+    <aside class="sidebar">
+      <a class="brand" href="/review"
+        ><span class="brand-mark">▥</span> 월급잇다</a
+      >
+      <a class="new-review" href="/review/new"><span>＋</span> 새 월급 검토</a>
+      <nav aria-label="주 메뉴">
+        <a href="/review">⌂ <span>내 홈</span></a>
+        <a href="/review/library">▤ <span>전체 자료함</span></a>
+      </nav>
+      <div class="nav-heading">
+        내 근무지 <span id="workplace-count">0곳</span>
+      </div>
+      <div id="workplaces" class="workplaces"></div>
+      <div class="sidebar-footer">
+        <span class="avatar">W</span>
+        <div>
+          <strong>내 작업실</strong><small>이 컴퓨터에 저장됩니다</small>
+        </div>
+        <a href="/ocr" title="기존 문서 작업실" aria-label="기존 문서 작업실"
+          >⚙</a
+        >
+      </div>
+    </aside>
+    <main id="main">
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+      <div id="content">
+        <p class="muted">검토 내용을 불러오는 중입니다.</p>
+      </div>
+    </main>
+    <div id="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

@@ -1,0 +1,70 @@
+/* A viewport-fixed assistant, independent of page and document scrolling. */
+.review-chat {position:fixed;right:24px;bottom:max(24px,env(safe-area-inset-bottom));z-index:80;display:flex;flex-direction:column;align-items:flex-end;gap:12px;pointer-events:none}
+.review-chat > * {pointer-events:auto}
+.chat-launcher {display:flex;align-items:center;justify-content:center;gap:10px;min-height:56px;padding:0 21px;border:1px solid #ffffff70;border-radius:28px;background:#7164d9;color:white;box-shadow:0 7px 24px #51469c35;font-size:14px;font-weight:700;transition:background .15s,box-shadow .15s}
+.chat-launcher:hover,.chat-launcher.is-open {background:#5f52c1;box-shadow:0 8px 28px #51469c50}
+.chat-launcher:focus-visible,.chat-close:focus-visible,.chat-send:focus-visible {outline:3px solid #a6a0f1;outline-offset:3px}
+.chat-panel {width:410px;height:min(650px,calc(100dvh - 116px));display:flex;flex-direction:column;overflow:hidden;background:#fff;border:1px solid #e0e3f0;border-radius:22px;box-shadow:0 16px 70px #27304426;color:#17232d}
+.chat-panel[hidden] {display:none}
+.chat-header {display:flex;align-items:center;justify-content:space-between;gap:10px;padding:21px 20px 16px;background:linear-gradient(120deg,#f4f1ff,#f6f8ff);border-bottom:1px solid #ececf7;flex:none}
+.chat-header h2 {font-size:18px;margin:0;color:#3c356b;letter-spacing:-.4px}
+.chat-header p {font-size:11px;margin:6px 0 0;color:#7c7795;line-height:1.5}
+.chat-close {align-self:flex-start;width:30px;height:30px;background:#ffffffa0;border:0;border-radius:50%;font-size:24px;color:#746e92;line-height:1}
+.chat-scope {display:flex;align-items:center;gap:10px;padding:12px 18px;border-bottom:1px solid #edf0f7;flex:none}
+.chat-scope label {font-size:11px;white-space:nowrap;color:#80879a}
+.chat-scope select {font-size:12px;min-width:0;width:100%;padding:7px 8px;border:1px solid #e5e8f2;border-radius:7px;background:#fafbfe;color:#525c70;text-overflow:ellipsis}
+.chat-scope select:disabled {opacity:1;appearance:none}
+.chat-log {flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:18px;scrollbar-width:thin;background:#fbfcff}
+.chat-welcome {padding:5px 1px 10px}
+.chat-welcome-mark {display:grid;place-items:center;width:38px;height:38px;border-radius:12px;color:#8172dd;background:#eeebfc;font-size:25px;margin-bottom:14px}
+.chat-welcome h3 {font-size:17px;letter-spacing:-.5px}
+.chat-welcome p {font-size:12px;color:#81899b;margin:9px 0 18px}
+.chat-prompt {display:block;width:100%;text-align:left;background:white;border:1px solid #e3e5f3;border-radius:11px;padding:11px 12px;margin-top:8px;font-size:12px;color:#656081;line-height:1.6}
+.chat-prompt:hover {border-color:#b7ace9;background:#f7f5ff}
+.chat-message {width:94%;margin:0 0 18px}
+.chat-message > small {display:block;font-size:10px;color:#8a8b9d;margin-bottom:6px}
+.chat-message-text {margin:0;padding:13px 14px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.85;border-radius:3px 15px 15px 15px;border:1px solid #e8ebf4;background:white}
+.chat-message.user {margin-left:auto;width:88%}
+.chat-message.user > small {text-align:right}
+.chat-message.user .chat-message-text {background:#eeeafb;color:#484067;border-color:#e6dff9;border-radius:15px 3px 15px 15px}
+.chat-sources {display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.chat-sources > small {width:100%;font-size:10px;color:#8b8ba1}
+.chat-source {display:block;max-width:100%;padding:7px 9px;border:1px solid #e0e4f3;border-radius:8px;font-size:11px;line-height:1.5;color:#6975ba;background:white;overflow-wrap:anywhere}
+.chat-source:hover {background:#f0f1fb;border-color:#bfc6ed}
+.chat-status,.chat-stale {font-size:11px;line-height:1.7;color:#858099}
+.chat-thinking {padding:10px 12px;background:#f0edf9;border-radius:10px}
+.chat-message .chat-mode {margin-top:8px;color:#9a7c39}
+.chat-stale {color:#987d40;margin:8px 0}
+.chat-error {font-size:12px;color:#a04b51;background:#fff2f3;padding:10px 18px;max-height:90px;overflow:auto;flex:none}
+.chat-compose {display:flex;align-items:flex-end;gap:9px;padding:13px 15px 5px;border-top:1px solid #edf0f7;background:white;flex:none}
+.chat-compose textarea {resize:vertical;min-width:0;min-height:48px;max-height:100px;flex:1;border:1px solid #e2e5f1;background:#fafbfe;border-radius:11px;padding:10px 11px;font-size:12px;line-height:1.6;color:#343b4f}
+.chat-compose textarea:focus {outline:2px solid #c9c0f1;outline-offset:0}
+.chat-compose textarea::placeholder {color:#9a9fb1}
+.chat-send {padding:12px 13px;min-height:44px;white-space:nowrap;border:0;border-radius:10px;background:#7768d8;color:white;font-size:12px;font-weight:700}
+.chat-footnote {margin:5px 16px 12px;font-size:10px;line-height:1.6;color:#989db0;flex:none}
+@media(max-width:600px) {
+  .review-chat {right:14px;bottom:max(14px,env(safe-area-inset-bottom));gap:10px}
+  .chat-panel {width:calc(100vw - 28px);height:min(650px,calc(100dvh - 100px));border-radius:18px}
+  .chat-launcher {min-height:52px;padding:0 18px;font-size:13px}
+  .chat-header {padding:17px 16px 13px}
+  .chat-log {padding:15px}
+  .chat-compose textarea {font-size:16px}
+}
+@media(prefers-reduced-motion:reduce) {.chat-launcher {transition:none}}
+
+.review-chat[hidden] {display:none}
+.chat-steps {display:grid;gap:11px;margin-top:12px}
+.chat-step {border:1px solid #e0e3f0;border-radius:13px;background:white;padding:13px 12px}
+.chat-step-head {display:flex;align-items:center;gap:7px;color:#7e8497;font-size:11px}
+.chat-step-number {display:grid;place-items:center;width:23px;height:23px;border-radius:50%;background:#eff0f7;color:#777d94;font-weight:700;flex:none}
+.chat-step-status {margin-left:auto;font-size:10px;white-space:nowrap}
+.chat-step h4 {margin:10px 0 5px;font-size:13px;line-height:1.55;color:#36324f}
+.chat-step p {margin:0;font-size:12px;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere}
+.chat-step-reason {display:block;font-size:10px;line-height:1.7;color:#9296a9;margin-top:8px}
+.chat-step .chat-source {margin-top:8px;font-size:10px}
+.chat-step.step-current {border-color:#bcb0ee;background:#fcfaff;box-shadow:inset 3px 0 #9480df}
+.step-current .chat-step-number {background:#8370d5;color:white}
+.step-current .chat-step-status {color:#816ace}
+.chat-step.step-blocked {border-color:#e7b7b8;box-shadow:inset 3px 0 #c96770}
+.step-blocked .chat-step-status {color:#b25660}
+.chat-step.step-completed .chat-step-number {background:#e3f2eb;color:#45866b}

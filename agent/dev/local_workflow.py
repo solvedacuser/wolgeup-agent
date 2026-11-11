@@ -441,6 +441,18 @@ class LocalPorts(LocalFilePorts):
         self.job["events"].append(event.model_dump(mode="json"))
         self.store.save_job(self.job)
 
+    async def save_checkpoint(self, context, checkpoint):
+        await super().save_checkpoint(context, checkpoint)
+        self.job["execution_nodes"] = copy.deepcopy(checkpoint.payload.get("__trace__", []))
+        self.store.save_job(self.job)
+
+    async def read_source(self, context, source):
+        content = await super().read_source(context, source)
+        metadata = self.store.documents.get(source.document_id)
+        if metadata:
+            content.mime_type = metadata.get("media_type", "application/pdf")
+        return content
+
     async def read_ocr(self, context, source, ocr_result_id):
         await self.check_access(context, [source])
         case = self.store.cases.get(context.case_id)
@@ -502,6 +514,9 @@ class LocalStore:
             if job["status"] in ("queued", "running"):
                 job.update(status="interrupted", error="서버가 중단되었습니다. 이어서 실행할 수 있습니다.")
                 self.save_job(job)
+        from agent.review.store import ReviewStore
+
+        self.reviews = ReviewStore(self)
 
     def save_case(self, case):
         folder = "comparisons" if case.get("kind") == "comparison" else "cases"
@@ -868,7 +883,8 @@ class LocalStore:
 
     def document_data(self, doc_id):
         doc = self.documents[doc_id]
-        data = (self.state / "uploads" / (doc_id + ".pdf")).read_bytes()
+        storage_id = doc.get("storage_document_id", doc_id)
+        data = (self.state / "uploads" / (storage_id + doc.get("extension", ".pdf"))).read_bytes()
         if content_hash(data) != doc["sha256"]:
             raise ValueError("자료 해시가 달라졌습니다.")
         return data
@@ -1246,6 +1262,9 @@ class LocalStore:
                     snapshot, case["confirmed_materials"], case["confirmed"]["material_review"]
                 )
             manual_sources = [{"ref": manual_ref.model_dump(mode="json"), "data": manual_data.decode()}]
+            manual_sources.extend(
+                copy.deepcopy((case.get("confirmed_materials") or {}).get("manual_sources", []))
+            )
             payload = AnalysisJobInput(
                 snapshot=snapshot,
                 snapshot_id=snapshot.snapshot_id,
