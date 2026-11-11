@@ -161,4 +161,4 @@ tesseract --list-langs
 
 `.env`의 `AGENT_OCR_COMMAND`는 `tesseract`로 설정하고, `AGENT_OCR_DATA_PATH`는 위 명령에 표시되는 언어 데이터 경로로 변경합니다. `kor`·`eng`가 모두 표시되는지 확인합니다.
 
-실행 후 API 문서: http://127.0.0.1:8000/docs
+
