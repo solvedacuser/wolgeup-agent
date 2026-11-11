@@ -43,7 +43,7 @@ uv run python -m app
 
 ## 환경 설정
 
-설정 파일은 **`devmerge/.env`**입니다. 루트 `agent/.env`와 구분합니다.
+설정 파일은 `devmerge/.env`입니다. 루트 `agent/.env`와 구분합니다.
 
 | 설정 | 용도 |
 | --- | --- |
